@@ -48,6 +48,109 @@ async def _init_connection(conn: asyncpg.Connection) -> None:
 #   可断点续跑、可并发执行。
 
 
+# 事件载荷对象存储（内容寻址 + S3 兼容对象存储，见 app/objectstore.py）：
+# - event_payload_objects：不可变载荷对象的元数据，主键即规范化 JSON 的 SHA-256；
+#   同一载荷全库去重，事件只按摘要引用，payload 字节本体存在对象存储中。
+# - events.payload_digest 引用对象摘要；events.payload JSONB 列仅为旧数据与
+#   在线迁移期的双读兜底保留（迁移完成后由 payloadadmin clear-legacy 清空）。
+# - payload_upload_pending：提交状态机的持久化状态——协调“对象上传”与
+#   “数据库事务”，任一步失败或进程崩溃后，残留行由恢复流程上传补传或清理，
+#   不产生可见半成品/悬空引用/重复投递。
+# - payload_migration_state / payload_gc_runs：在线迁移与垃圾回收的持久化
+#   进度/运行记录，均幂等、断点续跑。
+def _payload_schema_statements() -> list[str]:
+    return [
+        """
+        CREATE TABLE IF NOT EXISTS event_payload_objects (
+            digest         TEXT PRIMARY KEY,
+            size_bytes     BIGINT NOT NULL,
+            ref_count      INTEGER NOT NULL DEFAULT 0,
+            created_at     TIMESTAMPTZ NOT NULL DEFAULT now()
+        )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS payload_upload_pending (
+            id             BIGSERIAL PRIMARY KEY,
+            digest         TEXT NOT NULL,
+            source         TEXT NOT NULL,
+            event_id       TEXT NOT NULL,
+            payload_bytes  BYTEA NOT NULL,
+            owner_id       TEXT NOT NULL,
+            status         TEXT NOT NULL CHECK (status IN ('submitting')),
+            created_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
+            updated_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
+            UNIQUE (source, event_id)
+        )
+        """,
+        # 恢复接管时按摘要找候选；同摘要可被多个不同事件并发引用
+        """
+        CREATE INDEX IF NOT EXISTS idx_payload_pending_digest
+            ON payload_upload_pending (digest)
+        """,
+        """
+        ALTER TABLE events ADD COLUMN IF NOT EXISTS payload_digest TEXT
+            REFERENCES event_payload_objects(digest)
+        """,
+        # Worker/查询按摘要取对象引用；统计引用数走 events.payload_digest
+        """
+        CREATE INDEX IF NOT EXISTS idx_events_payload_digest
+            ON events (payload_digest)
+        """,
+        # 旧 JSONB 双读迁移扫描：仍按 JSONB 自存载荷、尚未挂对象引用的事件
+        """
+        CREATE INDEX IF NOT EXISTS idx_events_legacy_payload
+            ON events (id)
+            WHERE payload_digest IS NULL
+        """,
+        # 在线迁移的单行持久化进度（断点续跑游标）；id 恒为 1。
+        """
+        CREATE TABLE IF NOT EXISTS payload_migration_state (
+            id             INTEGER PRIMARY KEY DEFAULT 1,
+            status         TEXT NOT NULL CHECK (status IN
+                                ('running', 'completed', 'failed')),
+            last_event_id  BIGINT NOT NULL DEFAULT 0,
+            processed      BIGINT NOT NULL DEFAULT 0,
+            last_error     TEXT,
+            updated_at     TIMESTAMPTZ NOT NULL DEFAULT now()
+        )
+        """,
+        """
+        INSERT INTO payload_migration_state (id, status)
+        VALUES (1, 'running')
+        ON CONFLICT (id) DO NOTHING
+        """,
+        # 全新库（没有旧 JSONB 事件需要迁移）：直接标记迁移完成，避免状态
+        # 长期停留在 running；真正有旧数据的库此 UPDATE 命中 0 行，仍需
+        # payloadadmin migrate 在线迁移（不阻塞启动与投递）。
+        """
+        UPDATE payload_migration_state
+        SET status = 'completed', updated_at = now()
+        WHERE id = 1
+          AND status = 'running'
+          AND NOT EXISTS (SELECT 1 FROM events WHERE payload_digest IS NULL)
+        """,
+        # 垃圾回收运行记录（可观测/审计；删除决策不依赖本表，故 GC 本身幂等）
+        """
+        CREATE TABLE IF NOT EXISTS payload_gc_runs (
+            id              BIGSERIAL PRIMARY KEY,
+            status          TEXT NOT NULL CHECK (status IN ('running','completed','failed')),
+            candidates      BIGINT NOT NULL DEFAULT 0,
+            deleted_objects BIGINT NOT NULL DEFAULT 0,
+            rescanned_store BOOLEAN NOT NULL DEFAULT FALSE,
+            last_error      TEXT,
+            started_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+            finished_at     TIMESTAMPTZ
+        )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS payload_gc_candidates (
+            digest         TEXT PRIMARY KEY,
+            first_seen_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+        )
+        """,
+    ]
+
+
 def _schema_statements(
     max_attempts: int, backoff_base: float, backoff_cap: float
 ) -> list[str]:
@@ -139,11 +242,18 @@ def _schema_statements(
             id          BIGSERIAL PRIMARY KEY,
             source      TEXT NOT NULL,
             event_id    TEXT NOT NULL,
-            payload     JSONB NOT NULL DEFAULT '{}'::jsonb,
+            payload     JSONB,
             created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
             UNIQUE (source, event_id)
         )
         """,
+        # 旧库升级：新模型下载荷本体移到对象存储，payload JSONB 仅承载旧数据，
+        # 新事件该列为 NULL，故放宽历史 NOT NULL 约束。
+        """
+        ALTER TABLE events ALTER COLUMN payload DROP NOT NULL
+        """,
+        # 事件载荷对象引用（内容寻址；旧库升级幂等补充，见文件头说明）
+        *_payload_schema_statements(),
         # 投递链：重放时复用同一 chain_id，chain_seq 从 1 递增；链内严格有序
         "CREATE SEQUENCE IF NOT EXISTS delivery_chain_seq START 1",
         "CREATE SEQUENCE IF NOT EXISTS delivery_seq_global START 1",
@@ -196,7 +306,8 @@ def _schema_statements(
             finished_at      TIMESTAMPTZ,
             outcome          TEXT NOT NULL CHECK (outcome IN
                                  ('success', 'http_error', 'network_error', 'timeout',
-                                  'security_blocked', 'crypto_error')),
+                                  'security_blocked', 'crypto_error',
+                                  'payload_integrity')),
             http_status      INTEGER,
             response_excerpt TEXT,
             error_message    TEXT,
@@ -230,7 +341,8 @@ def _schema_statements(
                     ADD CONSTRAINT delivery_attempts_outcome_check
                     CHECK (outcome IN
                         ('success', 'http_error', 'network_error', 'timeout',
-                         'security_blocked', 'crypto_error'));
+                         'security_blocked', 'crypto_error',
+                         'payload_integrity'));
             END IF;
         END$$
         """,

@@ -307,69 +307,193 @@ async def get_current_version(
     )
 
 
-# -- 事件与投递创建 -------------------------------------------------------------
+# -- 事件与投递创建（载荷内容寻址 + 提交状态机） -----------------------------------
+#
+# 载荷不再直接写入 events.payload（该 JSONB 列只承载迁移前的旧数据）：
+# 规范化 JSON 的 SHA-256 是对象键，字节本体在 S3 兼容对象存储中，
+# event_payload_objects 保存元数据与引用计数，events.payload_digest 只做引用。
+#
+# “对象上传”与“数据库事务”无法用单一原子事务覆盖，因此提交由持久化状态机
+# （payload_upload_pending）协调，崩溃恢复见 app/payloads.py:recover_pending：
+#
+#   1. 快速查重（(source,event_id) 已存在 -> 幂等返回，不触对象存储）；
+#   2. 事务内登记 payload_upload_pending（含规范化字节，崩溃后可重放）：
+#      - 已有别的进程为同一事件登记 -> 其进行中/残留，交由恢复流程，本次报冲突；
+#   3. 事务外幂等 PUT 对象（内容寻址，同键同内容，重复/重放绝对安全）；
+#   4. 终结事务（锁对象元数据行）：upsert 对象元数据并维护引用计数、插入事件
+#      （payload 置 NULL，只挂摘要）、建投递、删除 pending 行——单事务原子，
+#      外部只能看到“完全没有该事件”或“事件+投递+对象引用齐备”，无半成品；
+#   5. 任一步失败：pending 行保留（字节就在行内，不依赖对象存储），恢复或
+#      重试从第 3 步继续；终结事务回滚则没有悬空引用，重放整步即可。
+#
+# 同一 (source,event_id) 的并发提交由 events 唯一约束兜底；重复提交不新增投递
+# 的幂等语义不变（第 1 步命中即直接返回原事件）。
 
-async def submit_event(
-    conn: asyncpg.Connection, source: str, event_id: str, payload: dict[str, Any]
-) -> tuple[asyncpg.Record, bool]:
-    """幂等写入事件并为该 source 的所有活跃订阅创建投递。
-
-    每条投递固化创建时刻该订阅的当前配置版本（deliveries.config_version_id）。
-    返回 (event 行, 是否重复提交)。重复提交不新增任何投递。
-
-    与发布新版本的边界：先对该 source 的活跃订阅行加 FOR UPDATE 行锁，
-    与 publish_version 互斥；两者均在单事务内提交，因此每条新投递必然落在
-    切换边界的确定一侧。
-    """
-    event_row = await conn.fetchrow(
+async def find_event_by_key(
+    conn: asyncpg.Connection, source: str, event_id: str
+) -> asyncpg.Record | None:
+    """按业务键查重（状态机第 1 步）；返回行含 payload_digest/旧 payload。"""
+    return await conn.fetchrow(
         """
-        INSERT INTO events (source, event_id, payload)
-        VALUES ($1, $2, $3::jsonb)
-        ON CONFLICT (source, event_id) DO NOTHING
-        RETURNING id, source, event_id, payload, created_at
+        SELECT id, source, event_id, payload, payload_digest, created_at
+        FROM events WHERE source = $1 AND event_id = $2
         """,
         source,
         event_id,
-        payload,
     )
-    duplicate = event_row is None
-    if duplicate:
+
+
+async def get_pending_submission_for_event(
+    conn: asyncpg.Connection, source: str, event_id: str
+) -> asyncpg.Record | None:
+    return await conn.fetchrow(
+        """
+        SELECT digest, source, event_id, payload_bytes, owner_id, created_at, updated_at
+        FROM payload_upload_pending
+        WHERE source = $1 AND event_id = $2
+        """,
+        source,
+        event_id,
+    )
+
+
+async def register_pending_submission(
+    conn: asyncpg.Connection,
+    *,
+    digest: str,
+    source: str,
+    event_id: str,
+    payload_bytes: bytes,
+    owner_id: str,
+) -> asyncpg.Record:
+    """登记提交状态机行（同事务）。
+
+    以 (source,event_id) 为唯一键：调用方已先查事件/进行中冲突，正常路径不会
+    撞键；同摘要可被多个不同事件并发引用（内容去重），互不影响各自的恢复。
+    """
+    return await conn.fetchrow(
+        """
+        INSERT INTO payload_upload_pending
+            (digest, source, event_id, payload_bytes, owner_id)
+        VALUES ($1, $2, $3, $4, $5)
+        RETURNING id, digest, source, event_id, payload_bytes, owner_id,
+                  created_at, updated_at
+        """,
+        digest,
+        source,
+        event_id,
+        payload_bytes,
+        owner_id,
+    )
+
+
+async def adopt_pending_submission(
+    conn: asyncpg.Connection, pending_id: int, owner_id: str
+) -> None:
+    await conn.execute(
+        """
+        UPDATE payload_upload_pending
+        SET owner_id = $2, updated_at = now()
+        WHERE id = $1
+        """,
+        pending_id,
+        owner_id,
+    )
+
+
+async def delete_pending_submission(
+    conn: asyncpg.Connection, source: str, event_id: str
+) -> None:
+    await conn.execute(
+        "DELETE FROM payload_upload_pending WHERE source = $1 AND event_id = $2",
+        source,
+        event_id,
+    )
+
+
+async def finalize_event_submission(
+    conn: asyncpg.Connection,
+    *,
+    source: str,
+    event_id: str,
+    digest: str,
+    size_bytes: int,
+) -> tuple[asyncpg.Record, bool]:
+    """提交状态机终结（单事务，原子可见）。
+
+    锁对象元数据行（不存在则插入，ref_count 从 0 计起）后插入事件并建投递；
+    事件唯一冲突说明并发重复提交已抢先完成：回滚本次引用计数增量，返回
+    (原事件行, True)。正常插入返回 (新事件行, False)。
+
+    新事件 payload JSONB 列置 NULL——载荷本体只在对象存储；该列仅旧数据使用。
+    """
+    async with conn.transaction():
+        # 与垃圾回收互斥：GC 删除在持有对象元数据行锁的事务内完成“复核→删对象
+        # →删元数据”，会阻塞这里的引用建立；反之本事务未提交时引用尚不可见，
+        # GC 复核必为零引用且本对象仍处于 pending（NOT EXISTS 守卫）而不会误删。
+        await conn.execute(
+            """
+            INSERT INTO event_payload_objects (digest, size_bytes, ref_count)
+            VALUES ($1, $2, 0)
+            ON CONFLICT (digest) DO NOTHING
+            """,
+            digest,
+            size_bytes,
+        )
+        # 行锁序列化对象的“引用建立”与 GC 的“行锁复核+删除”。
+        await conn.execute(
+            "SELECT digest FROM event_payload_objects WHERE digest = $1 FOR UPDATE",
+            digest,
+        )
         event_row = await conn.fetchrow(
             """
-            SELECT id, source, event_id, payload, created_at
-            FROM events WHERE source = $1 AND event_id = $2
+            INSERT INTO events (source, event_id, payload, payload_digest)
+            VALUES ($1, $2, NULL, $3)
+            ON CONFLICT (source, event_id) DO NOTHING
+            RETURNING id, source, event_id, payload, payload_digest, created_at
             """,
             source,
             event_id,
+            digest,
         )
-        return event_row, True
+        if event_row is None:
+            # 并发重复提交：原事件已存在（其引用由先提交者持有），本次不计数。
+            existing = await find_event_by_key(conn, source, event_id)
+            await delete_pending_submission(conn, source, event_id)
+            return existing, True
 
-    # 锁住该 source 的活跃订阅：与版本发布串行，读 current_revision 时无竞态。
-    await conn.execute(
-        """
-        SELECT id FROM subscriptions
-        WHERE source = $1 AND active = TRUE
-        ORDER BY id
-        FOR UPDATE
-        """,
-        source,
-    )
-    await conn.execute(
-        """
-        INSERT INTO deliveries
-            (event_id_fk, subscription_id, config_version_id,
-             chain_id, chain_seq, status)
-        SELECT e.id, s.id, v.id, nextval('delivery_chain_seq'), 1, 'pending'
-        FROM events e
-        JOIN subscriptions s ON s.source = $2 AND s.active = TRUE
-        JOIN subscription_versions v
-             ON v.subscription_id = s.id AND v.revision = s.current_revision
-        WHERE e.id = $1
-        """,
-        event_row["id"],
-        source,
-    )
-    return event_row, False
+        await conn.execute(
+            "UPDATE event_payload_objects SET ref_count = ref_count + 1 WHERE digest = $1",
+            digest,
+        )
+
+        # 锁住该 source 的活跃订阅：与版本发布串行，读 current_revision 时无竞态。
+        await conn.execute(
+            """
+            SELECT id FROM subscriptions
+            WHERE source = $1 AND active = TRUE
+            ORDER BY id
+            FOR UPDATE
+            """,
+            source,
+        )
+        await conn.execute(
+            """
+            INSERT INTO deliveries
+                (event_id_fk, subscription_id, config_version_id,
+                 chain_id, chain_seq, status)
+            SELECT e.id, s.id, v.id, nextval('delivery_chain_seq'), 1, 'pending'
+            FROM events e
+            JOIN subscriptions s ON s.source = $2 AND s.active = TRUE
+            JOIN subscription_versions v
+                 ON v.subscription_id = s.id AND v.revision = s.current_revision
+            WHERE e.id = $1
+            """,
+            event_row["id"],
+            source,
+        )
+        await delete_pending_submission(conn, source, event_id)
+        return event_row, False
 
 
 async def get_event(
@@ -377,7 +501,7 @@ async def get_event(
 ) -> asyncpg.Record | None:
     return await conn.fetchrow(
         """
-        SELECT id, source, event_id, payload, created_at
+        SELECT id, source, event_id, payload, payload_digest, created_at
         FROM events WHERE id = $1
         """,
         event_pk,
@@ -477,6 +601,7 @@ async def load_delivery_context(
                e.source,
                e.event_id,
                e.payload,
+               e.payload_digest,
                s.id AS subscription_pk,
                v.id AS config_version_pk,
                v.revision AS config_revision,
@@ -1031,3 +1156,340 @@ async def count_references_to_key(conn: asyncpg.Connection, key_id: str) -> int:
         """,
         key_id,
     )
+
+
+# -- 事件载荷：在线迁移 / 恢复 / 垃圾回收 / 状态 ------------------------------------
+#
+# 与密钥迁移同样的“取一批（FOR UPDATE SKIP LOCKED）→ 处理 → 提交”循环，
+# 幂等、断点续跑、可并发；与在线提交/Worker 互不阻塞（行级锁）。
+
+async def fetch_legacy_events_batch(
+    conn: asyncpg.Connection, *, after_id: int, limit: int
+) -> list[asyncpg.Record]:
+    """取一批仍以 JSONB 自存载荷（payload_digest 为空）的旧事件。
+
+    按 id 游标分页：进度只依赖已迁移后不再满足筛选条件，天然断点续跑。
+    """
+    rows = await conn.fetch(
+        """
+        SELECT id, payload
+        FROM events
+        WHERE payload_digest IS NULL AND id > $1
+        ORDER BY id
+        LIMIT $2
+        FOR UPDATE SKIP LOCKED
+        """,
+        after_id,
+        limit,
+    )
+    return list(rows)
+
+
+async def attach_payload_object_to_event(
+    conn: asyncpg.Connection,
+    *,
+    event_id_fk: int,
+    digest: str,
+    size_bytes: int,
+) -> None:
+    """把旧事件挂到内容寻址对象（同事务 upsert 元数据并维护引用计数）。
+
+    对象字节由调用方（payloadadmin）先幂等上传到对象存储；此处只做数据库侧
+    链接，因此与新提交共用同一份不可变对象、自动去重。锁对象行使引用建立与
+    GC 的“行锁复核+删除”互斥，杜绝迁移与 GC 并发时的悬空引用。
+    """
+    await conn.execute(
+        """
+        INSERT INTO event_payload_objects (digest, size_bytes, ref_count)
+        VALUES ($1, $2, 0)
+        ON CONFLICT (digest) DO NOTHING
+        """,
+        digest,
+        size_bytes,
+    )
+    await conn.execute(
+        "SELECT digest FROM event_payload_objects WHERE digest = $1 FOR UPDATE",
+        digest,
+    )
+    await conn.execute(
+        "UPDATE events SET payload_digest = $2 WHERE id = $1",
+        event_id_fk,
+        digest,
+    )
+    await conn.execute(
+        "UPDATE event_payload_objects SET ref_count = ref_count + 1 WHERE digest = $1",
+        digest,
+    )
+
+
+async def get_migration_state(conn: asyncpg.Connection) -> asyncpg.Record:
+    return await conn.fetchrow(
+        "SELECT id, status, last_event_id, processed, last_error, updated_at FROM payload_migration_state WHERE id = 1"
+    )
+
+
+async def update_migration_progress(
+    conn: asyncpg.Connection, *, last_event_id: int, processed_delta: int
+) -> None:
+    await conn.execute(
+        """
+        UPDATE payload_migration_state
+        SET last_event_id = GREATEST(last_event_id, $2),
+            processed = processed + $3,
+            status = 'running',
+            last_error = NULL,
+            updated_at = now()
+        WHERE id = 1
+        """,
+        last_event_id,
+        processed_delta,
+    )
+
+
+async def set_migration_status(
+    conn: asyncpg.Connection, status: str, error: str | None = None
+) -> None:
+    await conn.execute(
+        """
+        UPDATE payload_migration_state
+        SET status = $2, last_error = $3, updated_at = now()
+        WHERE id = 1
+        """,
+        status,
+        error,
+    )
+
+
+async def count_legacy_events(conn: asyncpg.Connection) -> int:
+    return await conn.fetchval(
+        "SELECT COUNT(*) FROM events WHERE payload_digest IS NULL"
+    )
+
+
+async def clear_legacy_payloads(conn: asyncpg.Connection, limit: int) -> int:
+    """迁移完成后清空 events.payload 旧 JSONB（分批，返回本批清空行数）。
+
+    仅清空已挂对象引用的行；未迁移行保留，因此任何时刻双读都有数据源。
+    """
+    result = await conn.execute(
+        """
+        UPDATE events SET payload = NULL
+        WHERE id IN (
+            SELECT id FROM events
+            WHERE payload_digest IS NOT NULL AND payload IS NOT NULL
+            LIMIT $1
+        )
+        """,
+        limit,
+    )
+    return int(result.split()[-1])
+
+
+# ---- 提交状态机崩溃恢复 ----
+
+async def list_stale_pending(
+    conn: asyncpg.Connection, *, stale_before: datetime, limit: int
+) -> list[asyncpg.Record]:
+    """列出崩溃/中断残留的提交状态机行（updated_at 早于阈值，可安全接管）。"""
+    rows = await conn.fetch(
+        """
+        SELECT id, digest, source, event_id, payload_bytes, owner_id,
+               created_at, updated_at
+        FROM payload_upload_pending
+        WHERE updated_at < $1
+        ORDER BY updated_at
+        LIMIT $2
+        FOR UPDATE SKIP LOCKED
+        """,
+        stale_before,
+        limit,
+    )
+    return list(rows)
+
+
+# ---- 垃圾回收 ----
+
+async def mark_gc_candidates(conn: asyncpg.Connection, grace_seconds: int) -> int:
+    """标记阶段：把“零引用且超过宽限期仍零引用”的对象纳入候选（幂等）。
+
+    三重保护，保证并发提交/重放正在引用的对象不被误删：
+    1. 只收集 event_payload_objects.ref_count = 0 的对象；
+    2. NOT EXISTS payload_upload_pending：进行中的提交（对象尚未在终结事务
+       建引用）不进入候选，避免“上传中即被标记”；
+    3. 候选首次见时间戳 + 宽限期（sweep 时再判一次），跨越宽限期的引用
+       抖动（旧事件对象删除后新事件恰好复用同一载荷）在 sweep 复核被复活。
+    """
+    result = await conn.execute(
+        """
+        INSERT INTO payload_gc_candidates (digest)
+        SELECT o.digest
+        FROM event_payload_objects o
+        WHERE o.ref_count = 0
+          AND NOT EXISTS (
+              SELECT 1 FROM payload_upload_pending p WHERE p.digest = o.digest
+          )
+        ON CONFLICT (digest) DO NOTHING
+        """,
+    )
+    return int(result.split()[-1])
+
+
+async def list_gc_candidates(
+    conn: asyncpg.Connection, *, grace_before: datetime, limit: int
+) -> list[str]:
+    rows = await conn.fetch(
+        """
+        SELECT digest
+        FROM payload_gc_candidates
+        WHERE first_seen_at < $1
+        ORDER BY first_seen_at
+        LIMIT $2
+        """,
+        grace_before,
+        limit,
+    )
+    return [r["digest"] for r in rows]
+
+
+async def recheck_gc_candidate(
+    conn: asyncpg.Connection, digest: str
+) -> str:
+    """删除前的最终引用复核（不持有事务，调用方需在事务内 FOR UPDATE 锁定）。
+
+    必须在调用方已开启的事务中、对对象元数据行加锁后使用；本函数只判定，
+    不改数据。返回：
+    - 'delete'   ：零引用且无进行中提交（或元数据不存在的存储孤儿键）；
+    - 'reanimate'：引用已重建（并发提交/重放复用了同一内容对象）或仍有进行中
+                   提交，候选应移除/重新计时，对象保留。
+    """
+    obj = await conn.fetchrow(
+        "SELECT ref_count FROM event_payload_objects WHERE digest = $1 FOR UPDATE",
+        digest,
+    )
+    in_flight = await conn.fetchval(
+        "SELECT 1 FROM payload_upload_pending WHERE digest = $1 LIMIT 1", digest
+    )
+    if in_flight is not None:
+        return "reanimate"
+    if obj is not None and obj["ref_count"] > 0:
+        return "reanimate"
+    return "delete"
+
+
+async def delete_payload_metadata_locked(
+    conn: asyncpg.Connection, digest: str
+) -> None:
+    """在已持有行锁的事务内删除候选行与（零引用的）对象元数据。"""
+    await conn.execute(
+        "DELETE FROM payload_gc_candidates WHERE digest = $1", digest
+    )
+    await conn.execute(
+        "DELETE FROM event_payload_objects WHERE digest = $1 AND ref_count = 0",
+        digest,
+    )
+
+
+async def remove_gc_candidate(conn: asyncpg.Connection, digest: str) -> None:
+    """复活：引用已重建，移除候选（对象保留）。"""
+    await conn.execute(
+        "DELETE FROM payload_gc_candidates WHERE digest = $1", digest
+    )
+
+
+async def rollback_gc_candidate(conn: asyncpg.Connection, digest: str) -> None:
+    """对象删除失败时回滚本候选：宽限重新计时，下次 GC 重试。"""
+    await conn.execute(
+        "UPDATE payload_gc_candidates SET first_seen_at = now() WHERE digest = $1",
+        digest,
+    )
+
+
+async def get_payload_object(
+    conn: asyncpg.Connection, digest: str
+) -> asyncpg.Record | None:
+    return await conn.fetchrow(
+        """
+        SELECT digest, size_bytes, ref_count, created_at
+        FROM event_payload_objects WHERE digest = $1
+        """,
+        digest,
+    )
+
+
+async def list_payload_objects(
+    conn: asyncpg.Connection, limit: int = 1000
+) -> list[asyncpg.Record]:
+    rows = await conn.fetch(
+        """
+        SELECT digest, size_bytes, ref_count, created_at
+        FROM event_payload_objects
+        ORDER BY digest
+        LIMIT $1
+        """,
+        limit,
+    )
+    return list(rows)
+
+
+async def count_payload_objects(conn: asyncpg.Connection) -> int:
+    return await conn.fetchval("SELECT COUNT(*) FROM event_payload_objects")
+
+
+async def count_payload_candidates(conn: asyncpg.Connection) -> int:
+    return await conn.fetchval("SELECT COUNT(*) FROM payload_gc_candidates")
+
+
+async def count_pending_submissions(conn: asyncpg.Connection) -> int:
+    return await conn.fetchval("SELECT COUNT(*) FROM payload_upload_pending")
+
+
+async def start_gc_run(
+    conn: asyncpg.Connection, *, rescanned_store: bool
+) -> int:
+    return await conn.fetchval(
+        """
+        INSERT INTO payload_gc_runs (status, rescanned_store)
+        VALUES ('running', $2)
+        RETURNING id
+        """,
+        rescanned_store,
+    )
+
+
+async def update_gc_run(
+    conn: asyncpg.Connection,
+    run_id: int,
+    *,
+    candidates: int,
+    deleted: int,
+    status: str,
+    error: str | None = None,
+) -> None:
+    await conn.execute(
+        """
+        UPDATE payload_gc_runs
+        SET status = $2, candidates = $3, deleted_objects = $4,
+            last_error = $5,
+            finished_at = CASE WHEN $2 = 'running' THEN NULL ELSE now() END
+        WHERE id = $1
+        """,
+        run_id,
+        status,
+        candidates,
+        deleted,
+        error,
+    )
+
+
+async def list_gc_runs(conn: asyncpg.Connection, limit: int = 10) -> list[asyncpg.Record]:
+    rows = await conn.fetch(
+        """
+        SELECT id, status, candidates, deleted_objects, rescanned_store,
+               last_error, started_at, finished_at
+        FROM payload_gc_runs
+        ORDER BY id DESC
+        LIMIT $1
+        """,
+        limit,
+    )
+    return list(rows)

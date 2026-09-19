@@ -18,6 +18,8 @@ class EventOut(BaseModel):
     source: str
     event_id: str
     payload: dict[str, Any]
+    # 载荷对象的内容地址（规范化 JSON 的 SHA-256）；旧数据迁移完成前可能为 None
+    payload_digest: str | None = None
     created_at: datetime
     duplicate: bool = False
 
@@ -85,7 +87,7 @@ class AttemptOut(BaseModel):
     finished_at: datetime | None
     outcome: Literal[
         "success", "http_error", "network_error", "timeout",
-        "security_blocked", "crypto_error"
+        "security_blocked", "crypto_error", "payload_integrity"
     ]
     http_status: int | None
     response_excerpt: str | None
@@ -162,3 +164,34 @@ class CryptoStatusOut(BaseModel):
     # 数据库引用但本地密钥环中不存在的 key_id（这些版本的投递会被拒绝）
     unknown_key_ids_in_use: list[str]
     rotations: list[RotationRunOut]
+
+
+class GCRunOut(BaseModel):
+    id: int
+    status: str
+    candidates: int
+    deleted_objects: int
+    rescanned_store: bool
+    last_error: str | None
+    started_at: datetime
+    finished_at: datetime | None
+
+
+class PayloadStorageStatusOut(BaseModel):
+    """事件载荷对象存储与迁移/回收状态（不含载荷内容）。"""
+
+    store_mode: str
+    bucket: str | None = None
+    total_events: int
+    # 仍只有 JSONB、未挂对象引用的旧事件数（双读迁移剩余量）
+    legacy_events_pending: int
+    # 去重后的不可变对象数与引用总数（引用数应 == 已迁移事件数）
+    payload_objects: int
+    total_references: int
+    total_object_bytes: int
+    # 提交状态机残留（崩溃待恢复）与 GC 候选数
+    pending_submissions: int
+    gc_candidates: int
+    gc_grace_seconds: int
+    migration: dict[str, Any]
+    gc_runs: list[GCRunOut]

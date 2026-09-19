@@ -42,6 +42,9 @@ COMMON_ENV = {
     "WEBHOOK_MAX_REDIRECTS": "5",
     # 订阅密钥信封加密的本地密钥环（测试主密钥）
     "WEBHOOK_KEYRING_JSON": '{"active_key_id":"k1","keys":{"k1":"MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY="}}',
+    # 事件载荷对象存储：测试用本地文件后端（无需 MinIO）
+    "PAYLOAD_STORE_MODE": "local",
+    "PAYLOAD_LOCAL_DIR": str(ROOT / ".test-payloads"),
     "PYTHONUNBUFFERED": "1",
 }
 

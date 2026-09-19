@@ -56,6 +56,10 @@ COMMON_ENV = {
     "WEBHOOK_ALLOWED_HOSTS": "127.0.0.1,localhost",
     "WEBHOOK_ALLOWED_CIDRS": "",
     "WEBHOOK_MAX_REDIRECTS": "5",
+    # 事件载荷对象存储：测试用本地文件后端（无需 MinIO）
+    "PAYLOAD_STORE_MODE": "local",
+    "PAYLOAD_LOCAL_DIR": str(ROOT / ".test-payloads-crypto"),
+    "PAYLOAD_STALE_AGE_SECONDS": "0.2",
     "PYTHONUNBUFFERED": "1",
 }
 

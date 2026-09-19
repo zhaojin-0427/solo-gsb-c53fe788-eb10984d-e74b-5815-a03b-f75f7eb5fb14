@@ -18,7 +18,7 @@ from datetime import datetime, timedelta, timezone
 
 import httpx
 
-from app import repository as repo
+from app import payloads, repository as repo
 from app import security
 from app.config import settings
 from app.db import init_db, close_pool
@@ -26,6 +26,7 @@ from app.egress_policy import EgressPolicyError, policy_from_env
 from app.egress_transport import PolicyAsyncTransport
 from app.envelope import SecretCryptoError, resolve_secret
 from app.keyring import get_keyring
+from app.objectstore import init_object_store
 
 log = logging.getLogger("webhook.worker")
 
@@ -101,7 +102,7 @@ async def deliver_once(
     )
 
 
-async def handle_one(pool, client: httpx.AsyncClient) -> bool:
+async def handle_one(pool, client: httpx.AsyncClient, payload_store) -> bool:
     """认领并处理一个任务；返回本轮是否处理了任务。"""
     async with pool.acquire() as conn:
         claim = await repo.claim_delivery(conn, WORKER_ID)
@@ -134,6 +135,38 @@ async def handle_one(pool, client: httpx.AsyncClient) -> bool:
         context["attempt_number"],
     )
 
+    # 取事件载荷：新格式从对象存储取回并复核 SHA-256 摘要后才允许签名；
+    # 旧 JSONB 数据（在线迁移未完成）回退读库，双读期间投递不中断。
+    # 对象缺失/摘要不符（损坏或被篡改）一律拒绝投递，记为 payload_integrity，
+    # 与普通失败一样参与退避/重试/死信结算。
+    try:
+        context["payload"] = await payloads.load_event_payload(
+            payload_store, context_row
+        )
+    except payloads.PayloadIntegrityError as exc:
+        log.error("投递 id=%s 载荷完整性校验失败: %s", delivery_id, exc)
+        outcome, http_status, excerpt, error_message, succeeded = (
+            "payload_integrity",
+            None,
+            None,
+            f"载荷完整性失败: {exc}",
+            False,
+        )
+        await _settle(
+            pool,
+            delivery_id=delivery_id,
+            lease_token=lease_token,
+            worker_id=WORKER_ID,
+            claim=claim,
+            outcome=outcome,
+            http_status=http_status,
+            excerpt=excerpt,
+            error_message=error_message,
+            succeeded=succeeded,
+            context=context,
+        )
+        return True
+
     # 仅在签名前解密订阅密钥（信封格式解包 DEK 后解密；旧明文格式直接回退）。
     # 未知 key_id / 认证失败 / 未配置密钥环：拒绝投递并记录可查询的 crypto_error，
     # 与普通失败一样参与退避/重试/死信结算（修复密钥环后可自动恢复）。
@@ -158,14 +191,43 @@ async def handle_one(pool, client: httpx.AsyncClient) -> bool:
             client, context
         )
 
-    # 租约栅栏：记录尝试与结算都校验 leased_by == lease_token，
-    # 若任务已因租约超时被接管，本次结果作废，避免覆盖新 Worker 的状态。
+    await _settle(
+        pool,
+        delivery_id=delivery_id,
+        lease_token=lease_token,
+        worker_id=WORKER_ID,
+        claim=claim,
+        outcome=outcome,
+        http_status=http_status,
+        excerpt=excerpt,
+        error_message=error_message,
+        succeeded=succeeded,
+        context=context,
+    )
+    return True
+
+
+async def _settle(
+    pool,
+    *,
+    delivery_id: int,
+    lease_token: str,
+    worker_id: str,
+    claim: dict,
+    outcome: str,
+    http_status: int | None,
+    excerpt: str | None,
+    error_message: str | None,
+    succeeded: bool,
+    context: dict,
+) -> None:
+    """租约栅栏下记录尝试并结算（复用 worker 主循环）。"""
     async with pool.acquire() as conn:
         attempt_number = await repo.record_attempt(
             conn,
             delivery_id=delivery_id,
             lease_token=lease_token,
-            worker_id=WORKER_ID,
+            worker_id=worker_id,
             outcome=outcome,
             http_status=http_status,
             response_excerpt=excerpt,
@@ -179,7 +241,7 @@ async def handle_one(pool, client: httpx.AsyncClient) -> bool:
                 delivery_id,
                 outcome,
             )
-            return True
+            return
 
         not_before = (
             None
@@ -214,12 +276,13 @@ async def handle_one(pool, client: httpx.AsyncClient) -> bool:
             attempt_number,
             outcome,
         )
-    return True
 
 
 async def run() -> None:
     log.info("Worker 启动 id=%s", WORKER_ID)
     pool = await init_db()
+    # 对象存储：桶不存在会自动创建；不可用则启动失败（避免每个任务都失败）。
+    payload_store = await init_object_store()
     # 启动时加载本地密钥环：配置非法直接退出；未配置则明文旧记录可投递、
     # 已加密记录以 crypto_error 结算（可查询），修复配置后自动恢复。
     get_keyring()
@@ -245,7 +308,7 @@ async def run() -> None:
         try:
             while not stop.is_set():
                 try:
-                    handled = await handle_one(pool, client)
+                    handled = await handle_one(pool, client, payload_store)
                 except Exception:  # noqa: BLE001 - Worker 主循环不能因单任务退出
                     log.exception("处理投递时发生未预期错误")
                     handled = False

@@ -4,7 +4,7 @@ from __future__ import annotations
 import asyncpg
 from fastapi import APIRouter, HTTPException, Query, Response
 
-from app import repository as repo
+from app import payloads, repository as repo
 from app.config import settings
 from app.db import get_pool
 from app.egress_policy import (
@@ -14,12 +14,18 @@ from app.egress_policy import (
     resolve_and_check,
 )
 from app.keyring import get_keyring
+from app.objectstore import (
+    ObjectStoreError,
+    get_object_store,
+)
 from app.schemas import (
     AttemptOut,
     CryptoStatusOut,
     DeliveryOut,
     EventCreate,
     EventOut,
+    GCRunOut,
+    PayloadStorageStatusOut,
     ReplayOut,
     ReplayRequest,
     RotationRunOut,
@@ -84,25 +90,71 @@ def _delivery_out(row: asyncpg.Record) -> DeliveryOut:
 
 # -- 事件 ----------------------------------------------------------------------
 
-@router.post("/events", response_model=EventOut, status_code=201, tags=["events"])
-async def submit_event(body: EventCreate, response: Response) -> EventOut:
-    """提交事件。(source, event_id) 重复时返回原事件且不新增投递（HTTP 200）。"""
-    pool = get_pool()
-    async with pool.acquire() as conn:
-        async with conn.transaction():
-            row, duplicate = await repo.submit_event(
-                conn, body.source, body.event_id, body.payload
-            )
-    if duplicate:
-        response.status_code = 200
+# 提交状态机 owner 标识（仅用于恢复接管的可观测性）
+_OWNER_ID = "api"
+
+
+async def _event_out(row: asyncpg.Record, *, duplicate: bool) -> EventOut:
+    """构造事件响应：payload 双读（对象存储优先，旧 JSONB 回退）。"""
+    payload: dict
+    digest = row["payload_digest"]
+    if digest is not None:
+        store = get_object_store()
+        data = await store.get_object(digest)
+        import json as _json
+
+        payload = _json.loads(data.decode("utf-8"))
+    else:
+        payload = dict(row["payload"]) if row["payload"] is not None else {}
     return EventOut(
         id=row["id"],
         source=row["source"],
         event_id=row["event_id"],
-        payload=dict(row["payload"]),
+        payload=payload,
+        payload_digest=digest,
         created_at=row["created_at"],
         duplicate=duplicate,
     )
+
+
+@router.post("/events", response_model=EventOut, status_code=201, tags=["events"])
+async def submit_event(body: EventCreate, response: Response) -> EventOut:
+    """提交事件。(source, event_id) 重复时返回原事件且不新增投递（HTTP 200）。
+
+    载荷以规范化 JSON 的 SHA-256 内容寻址存入对象存储；提交由持久化状态机
+    协调对象上传与数据库事务（失败/崩溃无半成品、无悬空引用、无重复投递）。
+    """
+    pool = get_pool()
+    store = get_object_store()
+    try:
+        async with pool.acquire() as conn:
+            row, duplicate = await payloads.submit_event_payload(
+                conn,
+                store,
+                source=body.source,
+                event_id=body.event_id,
+                payload=body.payload,
+                owner_id=_OWNER_ID,
+            )
+    except payloads.PayloadTooLarge as exc:
+        raise HTTPException(status_code=413, detail=str(exc))
+    except payloads.PayloadSubmitConflict as exc:
+        raise HTTPException(
+            status_code=409,
+            detail={"code": "event_submission_in_progress", "message": str(exc)},
+        )
+    except ObjectStoreError as exc:
+        # 对象存储不可用：提交未完成（状态机行已持久化，恢复/重试可续跑）。
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "code": "payload_store_unavailable",
+                "message": f"事件载荷对象存储暂不可用，请稍后重试: {exc}",
+            },
+        )
+    if duplicate:
+        response.status_code = 200
+    return await _event_out(row, duplicate=duplicate)
 
 
 @router.get("/events/{event_pk}", response_model=EventOut, tags=["events"])
@@ -112,13 +164,16 @@ async def get_event(event_pk: int) -> EventOut:
         row = await repo.get_event(conn, event_pk)
     if row is None:
         raise HTTPException(status_code=404, detail="事件不存在")
-    return EventOut(
-        id=row["id"],
-        source=row["source"],
-        event_id=row["event_id"],
-        payload=dict(row["payload"]),
-        created_at=row["created_at"],
-    )
+    try:
+        return await _event_out(row, duplicate=False)
+    except ObjectStoreError as exc:
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "code": "payload_store_unavailable",
+                "message": f"事件载荷对象存储暂不可用: {exc}",
+            },
+        )
 
 
 @router.get(
@@ -508,4 +563,51 @@ async def crypto_status() -> CryptoStatusOut:
         encrypted_versions_by_key_id=in_use,
         unknown_key_ids_in_use=sorted(k for k in in_use if k not in known),
         rotations=[RotationRunOut(**dict(r)) for r in rotations],
+    )
+
+
+# -- 事件载荷对象存储状态 -------------------------------------------------------------
+
+
+@router.get("/payloads/status", response_model=PayloadStorageStatusOut, tags=["payloads"])
+async def payload_storage_status() -> PayloadStorageStatusOut:
+    """事件载荷对象存储 / 在线迁移 / GC 状态（只含计数，绝不含载荷内容）。"""
+    pool = get_pool()
+    store = get_object_store()
+    async with pool.acquire() as conn:
+        total_events = await conn.fetchval("SELECT COUNT(*) FROM events")
+        legacy = await repo.count_legacy_events(conn)
+        objects = await repo.count_payload_objects(conn)
+        candidates = await repo.count_payload_candidates(conn)
+        pending = await repo.count_pending_submissions(conn)
+        migration = await payloads.migration_status(conn)
+        gc_runs = await repo.list_gc_runs(conn)
+        ref_sum = await conn.fetchval(
+            "SELECT COALESCE(SUM(ref_count), 0) FROM event_payload_objects"
+        )
+        bytes_sum = await conn.fetchval(
+            "SELECT COALESCE(SUM(size_bytes), 0) FROM event_payload_objects"
+        )
+    return PayloadStorageStatusOut(
+        store_mode=store.mode,
+        bucket=getattr(store, "bucket", None),
+        total_events=total_events,
+        legacy_events_pending=legacy,
+        payload_objects=objects,
+        total_references=ref_sum,
+        total_object_bytes=bytes_sum,
+        pending_submissions=pending,
+        gc_candidates=candidates,
+        gc_grace_seconds=settings.payload_gc_grace_seconds,
+        migration={
+            "status": migration["status"],
+            "processed": migration["processed"],
+            "remaining": migration["remaining"],
+            "last_event_id": migration["last_event_id"],
+            "last_error": migration["last_error"],
+            "updated_at": migration["updated_at"].isoformat()
+            if migration["updated_at"] is not None
+            else None,
+        },
+        gc_runs=[GCRunOut(**dict(r)) for r in gc_runs],
     )
