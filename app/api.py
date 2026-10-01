@@ -14,12 +14,16 @@ from app.egress_policy import (
     resolve_and_check,
 )
 from app.keyring import get_keyring
+from app.object_store import ObjectStoreError, get_object_store
+from app.payload_service import PayloadUnavailable, resolve_event_payload, submit_event
 from app.schemas import (
     AttemptOut,
     CryptoStatusOut,
     DeliveryOut,
     EventCreate,
     EventOut,
+    PayloadMigrationRunOut,
+    PayloadStorageStatusOut,
     ReplayOut,
     ReplayRequest,
     RotationRunOut,
@@ -85,21 +89,43 @@ def _delivery_out(row: asyncpg.Record) -> DeliveryOut:
 # -- 事件 ----------------------------------------------------------------------
 
 @router.post("/events", response_model=EventOut, status_code=201, tags=["events"])
-async def submit_event(body: EventCreate, response: Response) -> EventOut:
-    """提交事件。(source, event_id) 重复时返回原事件且不新增投递（HTTP 200）。"""
+async def submit_event_endpoint(body: EventCreate, response: Response) -> EventOut:
+    """提交事件。(source, event_id) 重复时返回原事件且不新增投递（HTTP 200）。
+
+    载荷按规范化 JSON 的 SHA-256 内容寻址先传不可变对象、再由数据库事务
+    原子引用（持久化状态机，见 app/payload_service.py）；对象存储不可用时
+    返回 503（payload_store_unavailable），不会产生半成品或悬空引用。
+    """
     pool = get_pool()
-    async with pool.acquire() as conn:
-        async with conn.transaction():
-            row, duplicate = await repo.submit_event(
-                conn, body.source, body.event_id, body.payload
-            )
+    store = get_object_store()
+    try:
+        row, duplicate = await submit_event(
+            pool, store, body.source, body.event_id, body.payload
+        )
+    except ObjectStoreError as exc:
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "code": "payload_store_unavailable",
+                "message": f"事件载荷对象存储暂不可用: {exc}",
+            },
+        )
     if duplicate:
         response.status_code = 200
+    payload = dict(row["payload"]) if row["payload"] is not None else None
+    if payload is None:
+        # 双读：JSONB 副本已切走时从对象存储取（带 SHA-256 复核）。
+        try:
+            payload = await resolve_event_payload(pool, store, row)
+        except PayloadUnavailable as exc:
+            raise HTTPException(
+                status_code=503, detail={"code": exc.code, "message": exc.message}
+            )
     return EventOut(
         id=row["id"],
         source=row["source"],
         event_id=row["event_id"],
-        payload=dict(row["payload"]),
+        payload=payload,
         created_at=row["created_at"],
         duplicate=duplicate,
     )
@@ -108,15 +134,24 @@ async def submit_event(body: EventCreate, response: Response) -> EventOut:
 @router.get("/events/{event_pk}", response_model=EventOut, tags=["events"])
 async def get_event(event_pk: int) -> EventOut:
     pool = get_pool()
+    store = get_object_store()
     async with pool.acquire() as conn:
         row = await repo.get_event(conn, event_pk)
     if row is None:
         raise HTTPException(status_code=404, detail="事件不存在")
+    payload = dict(row["payload"]) if row["payload"] is not None else None
+    if payload is None:
+        try:
+            payload = await resolve_event_payload(pool, store, row)
+        except PayloadUnavailable as exc:
+            raise HTTPException(
+                status_code=503, detail={"code": exc.code, "message": exc.message}
+            )
     return EventOut(
         id=row["id"],
         source=row["source"],
         event_id=row["event_id"],
-        payload=dict(row["payload"]),
+        payload=payload,
         created_at=row["created_at"],
     )
 
@@ -508,4 +543,37 @@ async def crypto_status() -> CryptoStatusOut:
         encrypted_versions_by_key_id=in_use,
         unknown_key_ids_in_use=sorted(k for k in in_use if k not in known),
         rotations=[RotationRunOut(**dict(r)) for r in rotations],
+    )
+
+
+@router.get(
+    "/payload-storage/status",
+    response_model=PayloadStorageStatusOut,
+    tags=["payload-storage"],
+)
+async def payload_storage_status() -> PayloadStorageStatusOut:
+    """载荷对象存储、在线迁移与垃圾回收状态（只含计数/摘要，不含载荷内容）。"""
+    from app.payload_service import DUAL_WRITE_DEFAULT, DUAL_WRITE_META_KEY
+
+    pool = get_pool()
+    store = get_object_store()
+    async with pool.acquire() as conn:
+        dual = await repo.get_meta_flag(conn, DUAL_WRITE_META_KEY, DUAL_WRITE_DEFAULT)
+        legacy = await repo.count_legacy_payload_events(conn)
+        dual_copy = await repo.count_dual_copy_events(conn)
+        committed = await repo.count_committed_payloads(conn)
+        uploading = await repo.count_uploading_payloads(conn)
+        claims = await repo.count_gc_claims(conn)
+        migrations = await repo.list_payload_migrations(conn)
+    return PayloadStorageStatusOut(
+        configured=True,
+        endpoint_url=settings.s3_endpoint_url or "(aws default endpoint)",
+        bucket=settings.s3_bucket,
+        dual_write_jsonb=dual,
+        legacy_events_pending=legacy,
+        dual_copy_events=dual_copy,
+        committed_objects=committed,
+        uploading_objects=uploading,
+        gc_claims=claims,
+        migrations=[PayloadMigrationRunOut(**dict(r)) for r in migrations],
     )

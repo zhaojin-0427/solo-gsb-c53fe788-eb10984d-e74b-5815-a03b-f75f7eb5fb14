@@ -308,68 +308,155 @@ async def get_current_version(
 
 
 # -- 事件与投递创建 -------------------------------------------------------------
+#
+# 载荷内容寻址 + 持久化提交状态机（对象存储与数据库的两阶段协调）：
+#
+#   阶段 1（begin）：事务内 upsert event_payloads(status='uploading') 并提交。
+#       行先于对象存在，是“即将上传对象 sha=X”的持久化意图；崩溃后该行可被
+#       下一次同摘要提交幂等接管，或在宽限期后被 GC 回收。
+#   阶段 2（对象上传，无数据库事务）：按内容地址幂等上传不可变对象，
+#       已存在即复用（相同 sha 字节必然相同）。
+#   阶段 3（commit）：事务内把状态推进为 committed，同一事务插入事件与投递。
+#       事件外键只接受 committed 对象，因此不存在悬空引用；重复提交时
+#       事件唯一冲突 -> 不插入任何投递（幂等）。
+#
+# 不变量：对象可能暂时多于目录（孤儿对象，GC 负责），但目录中 committed 的
+# 对象在被事件引用期间必然存在；任何时刻对外可见的事件都指向完整对象。
 
-async def submit_event(
-    conn: asyncpg.Connection, source: str, event_id: str, payload: dict[str, Any]
+
+async def begin_event_payload(
+    conn: asyncpg.Connection, sha: str, object_key: str, size_bytes: int
+) -> None:
+    """阶段 1：登记（或接管）上传意图并提交。
+
+    已存在 committed 行：对象此前已上传，幂等返回（上传仍会做 head 复核）。
+    已存在 uploading 行：崩溃残留或并发提交，幂等接管（不改时间戳，避免
+    不断刷新 updated_at 导致 GC 宽限期永远无法到达）。
+    """
+    async with conn.transaction():
+        await conn.execute(
+            """
+            INSERT INTO event_payloads (sha256, object_key, size_bytes, status)
+            VALUES ($1, $2, $3, 'uploading')
+            ON CONFLICT (sha256) DO NOTHING
+            """,
+            sha,
+            object_key,
+            size_bytes,
+        )
+
+
+async def commit_event(
+    conn: asyncpg.Connection,
+    *,
+    source: str,
+    event_id: str,
+    payload: dict[str, Any] | None,
+    sha: str,
+    dual_write_jsonb: bool,
 ) -> tuple[asyncpg.Record, bool]:
-    """幂等写入事件并为该 source 的所有活跃订阅创建投递。
+    """阶段 3：提交对象状态机并原子写入事件与投递（单事务）。
 
-    每条投递固化创建时刻该订阅的当前配置版本（deliveries.config_version_id）。
-    返回 (event 行, 是否重复提交)。重复提交不新增任何投递。
+    - event_payloads 行进 committed（幂等；必须存在阶段 1 的 uploading 行）；
+    - 插入事件（(source, event_id) 冲突即重复提交：不新增任何投递）；
+    - 迁移/双写开关开启时同时写 payload JSONB，供旧版本进程双读；
+    - 为该 source 的所有活跃订阅创建投递，固化当前配置版本。
 
     与发布新版本的边界：先对该 source 的活跃订阅行加 FOR UPDATE 行锁，
-    与 publish_version 互斥；两者均在单事务内提交，因此每条新投递必然落在
-    切换边界的确定一侧。
+    与 publish_version 互斥；每条新投递必然落在切换边界的确定一侧。
+    返回 (event 行, 是否重复提交)。
     """
-    event_row = await conn.fetchrow(
-        """
-        INSERT INTO events (source, event_id, payload)
-        VALUES ($1, $2, $3::jsonb)
-        ON CONFLICT (source, event_id) DO NOTHING
-        RETURNING id, source, event_id, payload, created_at
-        """,
-        source,
-        event_id,
-        payload,
-    )
-    duplicate = event_row is None
-    if duplicate:
+    async with conn.transaction():
+        # 状态机推进：对象已上传完毕，目录行才允许 committed。
+        # updated_at 只在 uploading -> committed 时推进。
+        await conn.execute(
+            """
+            UPDATE event_payloads
+            SET status = 'committed',
+                committed_at = COALESCE(committed_at, now()),
+                updated_at = now()
+            WHERE sha256 = $1
+            """,
+            sha,
+        )
         event_row = await conn.fetchrow(
             """
-            SELECT id, source, event_id, payload, created_at
-            FROM events WHERE source = $1 AND event_id = $2
+            INSERT INTO events (source, event_id, payload, payload_sha256)
+            VALUES ($1, $2, $3::jsonb, $4)
+            ON CONFLICT (source, event_id) DO NOTHING
+            RETURNING id, source, event_id, payload, payload_sha256, created_at
             """,
             source,
             event_id,
+            payload if dual_write_jsonb else None,
+            sha,
         )
-        return event_row, True
+        duplicate = event_row is None
+        if duplicate:
+            event_row = await conn.fetchrow(
+                """
+                SELECT id, source, event_id, payload, payload_sha256, created_at
+                FROM events WHERE source = $1 AND event_id = $2
+                """,
+                source,
+                event_id,
+            )
+            return event_row, True
 
-    # 锁住该 source 的活跃订阅：与版本发布串行，读 current_revision 时无竞态。
+        # 锁住该 source 的活跃订阅：与版本发布串行，读 current_revision 时无竞态。
+        await conn.execute(
+            """
+            SELECT id FROM subscriptions
+            WHERE source = $1 AND active = TRUE
+            ORDER BY id
+            FOR UPDATE
+            """,
+            source,
+        )
+        await conn.execute(
+            """
+            INSERT INTO deliveries
+                (event_id_fk, subscription_id, config_version_id,
+                 chain_id, chain_seq, status)
+            SELECT e.id, s.id, v.id, nextval('delivery_chain_seq'), 1, 'pending'
+            FROM events e
+            JOIN subscriptions s ON s.source = $2 AND s.active = TRUE
+            JOIN subscription_versions v
+                 ON v.subscription_id = s.id AND v.revision = s.current_revision
+            WHERE e.id = $1
+            """,
+            event_row["id"],
+            source,
+        )
+        return event_row, False
+
+
+async def get_meta_flag(conn: asyncpg.Connection, key: str, default: bool) -> bool:
+    """读取 app_meta 中的布尔开关（不存在返回 default）。
+
+    存储格式为 JSON 对象 {"enabled": true/false}（不能存 JSON 标量字符串
+    "false"——Python 中非空字符串会被当成真）。
+    """
+    value = await conn.fetchval("SELECT value FROM app_meta WHERE key = $1", key)
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, dict):
+        return bool(value.get("enabled"))
+    return default
+
+
+async def set_meta_flag(conn: asyncpg.Connection, key: str, value: bool) -> None:
     await conn.execute(
         """
-        SELECT id FROM subscriptions
-        WHERE source = $1 AND active = TRUE
-        ORDER BY id
-        FOR UPDATE
+        INSERT INTO app_meta (key, value, updated_at)
+        VALUES ($1, $2::jsonb, now())
+        ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = now()
         """,
-        source,
+        key,
+        {"enabled": value},
     )
-    await conn.execute(
-        """
-        INSERT INTO deliveries
-            (event_id_fk, subscription_id, config_version_id,
-             chain_id, chain_seq, status)
-        SELECT e.id, s.id, v.id, nextval('delivery_chain_seq'), 1, 'pending'
-        FROM events e
-        JOIN subscriptions s ON s.source = $2 AND s.active = TRUE
-        JOIN subscription_versions v
-             ON v.subscription_id = s.id AND v.revision = s.current_revision
-        WHERE e.id = $1
-        """,
-        event_row["id"],
-        source,
-    )
-    return event_row, False
 
 
 async def get_event(
@@ -377,7 +464,7 @@ async def get_event(
 ) -> asyncpg.Record | None:
     return await conn.fetchrow(
         """
-        SELECT id, source, event_id, payload, created_at
+        SELECT id, source, event_id, payload, payload_sha256, created_at
         FROM events WHERE id = $1
         """,
         event_pk,
@@ -468,6 +555,9 @@ async def load_delivery_context(
     因而切换边界前创建的投递及其后续重试、接管，永远使用旧版本的 URL 与密钥。
     密钥的密文/包裹 DEK 在此一并取出，由 Worker 在签名前才解密（见
     app/envelope.py）；旧格式（迁移未完成）则回退读取 secret 明文列。
+
+    事件载荷只返回内容地址（sha + object_key）与迁移期双读兜底的 JSONB：
+    Worker 从对象存储取字节并复核 SHA-256 后才签名投递（见 app/worker.py）。
     """
     return await conn.fetchrow(
         """
@@ -476,7 +566,10 @@ async def load_delivery_context(
                e.id AS event_pk,
                e.source,
                e.event_id,
-               e.payload,
+               e.payload AS legacy_payload,
+               e.payload_sha256,
+               p.object_key,
+               p.status AS payload_status,
                s.id AS subscription_pk,
                v.id AS config_version_pk,
                v.revision AS config_revision,
@@ -490,6 +583,7 @@ async def load_delivery_context(
                v.backoff_cap_seconds
         FROM deliveries d
         JOIN events e ON e.id = d.event_id_fk
+        LEFT JOIN event_payloads p ON p.sha256 = e.payload_sha256
         JOIN subscriptions s ON s.id = d.subscription_id
         JOIN subscription_versions v ON v.id = d.config_version_id
         WHERE d.id = $1
@@ -1031,3 +1125,430 @@ async def count_references_to_key(conn: asyncpg.Connection, key_id: str) -> int:
         """,
         key_id,
     )
+
+
+# -- 事件载荷：状态机 / 迁移 / 垃圾回收 ------------------------------------------
+#
+# 垃圾回收的两类目标，均带“引用复核 + 宽限期 + 两阶段”：
+# - abandoned_upload：event_payloads 中宽限期后仍为 uploading 且已无事件引用
+#   （提交进程崩溃残留）的目录行，连同其（可能存在的）对象一起回收；
+# - orphan_object：S3 桶中存在、但数据库目录完全没有的对象（阶段 1 后、
+#   阶段 3 前进程被杀；或对象被带外写入）。
+#
+# 与并发提交/重放的互斥靠两点保证：
+# 1) 所有回收决策都在事务内对该 sha 的“资源集合”做行锁/咨询锁串行化——
+#    提交协议阶段 1 的 upsert 与 GC 的“无目录行”分支抢同一把按 sha 派生的
+#    事务级咨询锁，谁先拿到锁谁先做存在性复核，因此不会出现“GC 刚删完、
+#    提交已引用”的窗口；
+# 2) 物理删除 S3 对象在宽限期后的第二阶段执行，删除前再次复核目录中无
+#    committed 引用、无删除期间新生的事件引用。
+#
+# 重放不创建新事件（只新建投递），引用的还是原事件的同一对象，因此
+# “events 是否引用”就是充分的引用复核。
+
+# 咨询锁标签（bigint），与 db.py DDL 串行锁 91247 区分。
+ADV_LOCK_ORPHAN_GC = 912480
+
+
+def advisory_key_for_sha(sha: str) -> int:
+    """把 64 位 hex 摘要映射到 Postgres bigint 咨询锁键（取前 15 个 hex）。"""
+    return int(sha[:15], 16)
+
+
+async def get_payload_status(
+    conn: asyncpg.Connection, sha: str
+) -> asyncpg.Record | None:
+    return await conn.fetchrow(
+        """
+        SELECT sha256, object_key, size_bytes, status, created_at, updated_at,
+               committed_at
+        FROM event_payloads WHERE sha256 = $1
+        """,
+        sha,
+    )
+
+
+async def count_payload_references(conn: asyncpg.Connection, sha: str) -> int:
+    """事件对某载荷对象的引用数（GC 引用复核的唯一权威来源）。"""
+    return await conn.fetchval(
+        "SELECT COUNT(*) FROM events WHERE payload_sha256 = $1", sha
+    )
+
+
+# -- 在线迁移（JSONB -> 对象存储）-------------------------------------------------
+
+async def start_or_adopt_payload_migration(conn: asyncpg.Connection) -> asyncpg.Record:
+    """开始或接管一次载荷迁移运行（running/failed 记录存在则续跑）。"""
+    for _attempt in range(2):
+        async with conn.transaction():
+            existing = await conn.fetchrow(
+                """
+                SELECT id, status, processed_count, last_event_id, last_error,
+                       started_at, updated_at, finished_at
+                FROM payload_migrations
+                WHERE status IN ('running', 'failed')
+                ORDER BY id
+                LIMIT 1
+                FOR UPDATE
+                """
+            )
+            if existing is not None:
+                await conn.execute(
+                    """
+                    UPDATE payload_migrations
+                    SET status = 'running', last_error = NULL,
+                        updated_at = now(), finished_at = NULL
+                    WHERE id = $1
+                    """,
+                    existing["id"],
+                )
+                return existing
+            try:
+                row = await conn.fetchrow(
+                    """
+                    INSERT INTO payload_migrations (status)
+                    VALUES ('running')
+                    RETURNING id, status, processed_count, last_event_id, last_error,
+                              started_at, updated_at, finished_at
+                    """
+                )
+                return row
+            except asyncpg.UniqueViolationError:
+                continue
+    raise RuntimeError("无法创建或接管载荷迁移运行（并发冲突）")
+
+
+async def fetch_legacy_payload_batch(
+    conn: asyncpg.Connection, last_id: int, limit: int
+) -> list[asyncpg.Record]:
+    """取一批仍只有 JSONB、未回填内容地址的事件（FOR UPDATE SKIP LOCKED）。"""
+    rows = await conn.fetch(
+        """
+        SELECT id, payload, payload_sha256
+        FROM events
+        WHERE id > $1 AND payload_sha256 IS NULL
+        ORDER BY id
+        LIMIT $2
+        FOR UPDATE SKIP LOCKED
+        """,
+        last_id,
+        limit,
+    )
+    return list(rows)
+
+
+async def attach_event_payload(
+    conn: asyncpg.Connection, event_id: int, sha: str
+) -> None:
+    """把已上传对象的摘要回填到事件（同事务要求对象目录已 committed）。"""
+    await conn.execute(
+        "UPDATE events SET payload_sha256 = $2 WHERE id = $1", event_id, sha
+    )
+
+
+async def ensure_payload_committed(
+    conn: asyncpg.Connection,
+    sha: str,
+    object_key: str,
+    size_bytes: int,
+) -> None:
+    """迁移用：upsert 目录行并直接置 committed（对象已由调用方上传）。"""
+    await conn.execute(
+        """
+        INSERT INTO event_payloads
+            (sha256, object_key, size_bytes, status, committed_at)
+        VALUES ($1, $2, $3, 'committed', now())
+        ON CONFLICT (sha256) DO UPDATE
+            SET status = 'committed',
+                committed_at = COALESCE(event_payloads.committed_at, now()),
+                updated_at = now()
+        """,
+        sha,
+        object_key,
+        size_bytes,
+    )
+
+
+async def clear_event_jsonb(conn: asyncpg.Connection, event_id: int) -> None:
+    """双读切换后释放某事件的 JSONB 副本（权威数据在对象存储）。"""
+    await conn.execute(
+        "UPDATE events SET payload = NULL WHERE id = $1 AND payload_sha256 IS NOT NULL",
+        event_id,
+    )
+
+
+async def update_payload_migration_progress(
+    conn: asyncpg.Connection, migration_id: int, processed: int, last_event_id: int
+) -> None:
+    await conn.execute(
+        """
+        UPDATE payload_migrations
+        SET processed_count = processed_count + $2,
+            last_event_id = GREATEST(last_event_id, $3),
+            updated_at = now()
+        WHERE id = $1
+        """,
+        migration_id,
+        processed,
+        last_event_id,
+    )
+
+
+async def finish_payload_migration(
+    conn: asyncpg.Connection, status: str, error: str | None = None
+) -> None:
+    await conn.execute(
+        """
+        UPDATE payload_migrations
+        SET status = $1, last_error = $2, updated_at = now(), finished_at = now()
+        WHERE id = (
+            SELECT id FROM payload_migrations
+            WHERE status IN ('running', 'failed')
+            ORDER BY id DESC LIMIT 1
+        )
+        """,
+        status,
+        error,
+    )
+
+
+async def list_payload_migrations(
+    conn: asyncpg.Connection, limit: int = 10
+) -> list[asyncpg.Record]:
+    rows = await conn.fetch(
+        """
+        SELECT id, status, processed_count, last_event_id, last_error,
+               started_at, updated_at, finished_at
+        FROM payload_migrations
+        ORDER BY id DESC
+        LIMIT $1
+        """,
+        limit,
+    )
+    return list(rows)
+
+
+async def count_legacy_payload_events(conn: asyncpg.Connection) -> int:
+    """仍未回填内容地址的旧事件数（迁移进度）。"""
+    return await conn.fetchval(
+        "SELECT COUNT(*) FROM events WHERE payload_sha256 IS NULL"
+    )
+
+
+async def count_dual_copy_events(conn: asyncpg.Connection) -> int:
+    """同时保留 JSONB 副本的事件数（切换/回收进度）。"""
+    return await conn.fetchval(
+        "SELECT COUNT(*) FROM events WHERE payload_sha256 IS NOT NULL AND payload IS NOT NULL"
+    )
+
+
+async def count_committed_payloads(conn: asyncpg.Connection) -> int:
+    return await conn.fetchval(
+        "SELECT COUNT(*) FROM event_payloads WHERE status = 'committed'"
+    )
+
+
+async def count_uploading_payloads(conn: asyncpg.Connection) -> int:
+    return await conn.fetchval(
+        "SELECT COUNT(*) FROM event_payloads WHERE status = 'uploading'"
+    )
+
+
+# -- 垃圾回收 ---------------------------------------------------------------------
+
+async def fetch_abandoned_uploads(
+    conn: asyncpg.Connection, stale_before, limit: int
+) -> list[asyncpg.Record]:
+    """宽限期后仍 uploading、且当前无事件引用的目录行（行锁，跳过被锁行）。
+
+    无引用复核必须与删除决策同事务；updated_at 只在阶段 1 插入/状态推进时
+    变化，并发提交的幂等接管不会刷新它，因此宽限期语义稳定。
+    """
+    rows = await conn.fetch(
+        """
+        SELECT p.sha256, p.object_key, p.size_bytes, p.updated_at
+        FROM event_payloads p
+        WHERE p.status = 'uploading'
+          AND p.updated_at < $1
+          AND NOT EXISTS (
+              SELECT 1 FROM events e WHERE e.payload_sha256 = p.sha256
+          )
+        ORDER BY p.updated_at
+        LIMIT $2
+        FOR UPDATE OF p SKIP LOCKED
+        """,
+        stale_before,
+        limit,
+    )
+    return list(rows)
+
+
+async def delete_payload_row(conn: asyncpg.Connection, sha: str) -> None:
+    """删除无引用的 uploading 目录行（仅 GC abandoned 分支调用）。"""
+    await conn.execute(
+        """
+        DELETE FROM event_payloads
+        WHERE sha256 = $1 AND status = 'uploading'
+          AND NOT EXISTS (SELECT 1 FROM events WHERE payload_sha256 = $1)
+        """,
+        sha,
+    )
+
+
+async def register_orphan_claim(
+    conn: asyncpg.Connection,
+    sha: str,
+    object_key: str,
+    reason: str,
+    delete_due_at,
+) -> str:
+    """GC 阶段一：登记删除凭证（幂等）。
+
+    必须在持有按 sha 派生的事务级咨询锁时调用（与提交协议阶段 1 的
+    “无目录行”分支互斥）。登记前复核：目录中已出现该 sha（committed 或
+    uploading）则取消/跳过；已存在凭证则沿用其状态。
+    返回登记后的状态：registered / delete_due / cancelled。
+    """
+    existing_meta = await conn.fetchrow(
+        "SELECT status, object_key FROM event_payloads WHERE sha256 = $1", sha
+    )
+    if existing_meta is not None:
+        # 对象已被提交或正在提交：若此前登记过凭证则标记取消。
+        await conn.execute(
+            "UPDATE payload_gc_claims SET status = 'cancelled', finished_at = now() "
+            "WHERE sha256 = $1 AND status IN ('registered', 'delete_due')",
+            sha,
+        )
+        return "cancelled"
+    row = await conn.fetchrow(
+        """
+        INSERT INTO payload_gc_claims
+            (sha256, object_key, reason, status, delete_due_at,
+             finished_at, last_error)
+        VALUES ($1, $2, $3, 'registered', $4, NULL, NULL)
+        ON CONFLICT (sha256) DO UPDATE
+            SET object_key = EXCLUDED.object_key,
+                reason = EXCLUDED.reason,
+                status = 'registered',
+                delete_due_at = EXCLUDED.delete_due_at,
+                finished_at = NULL,
+                last_error = NULL
+        RETURNING status
+        """,
+        sha,
+        object_key,
+        reason,
+        delete_due_at,
+    )
+    return row["status"]
+
+
+async def fetch_due_claims(conn: asyncpg.Connection, now, limit: int) -> list[asyncpg.Record]:
+    """取到了宽限期、等待阶段二删除的凭证（行锁）。"""
+    return list(
+        await conn.fetch(
+            """
+            SELECT sha256, object_key, reason, registered_at, delete_due_at
+            FROM payload_gc_claims
+            WHERE status = 'registered' AND delete_due_at <= $1
+            ORDER BY delete_due_at
+            LIMIT $2
+            FOR UPDATE SKIP LOCKED
+            """,
+            now,
+            limit,
+        )
+    )
+
+
+async def recheck_claim_removable(conn: asyncpg.Connection, sha: str) -> bool:
+    """删除前最终引用复核：目录必须完全无行且无事件引用。
+
+    - committed 行：对象在服役，绝不可删；
+    - uploading 行：存在（可能是刚刚发生的）上传意图——提交协议阶段 3 会在
+      同一把咨询锁下复核对象并按需重传，因此这里也判定不可删并取消凭证
+      （若该意图最终被放弃，宽限期后会以 abandoned_upload 重新登记回收）；
+    - 任何 events 引用：不可删（死信重放只新建投递，引用不变，故事件引用
+      是充分复核）。
+    """
+    meta = await conn.fetchrow(
+        "SELECT status FROM event_payloads WHERE sha256 = $1", sha
+    )
+    if meta is not None:
+        return False
+    refs = await conn.fetchval(
+        "SELECT COUNT(*) FROM events WHERE payload_sha256 = $1", sha
+    )
+    return refs == 0
+
+
+async def mark_claim_deleted(conn: asyncpg.Connection, sha: str) -> None:
+    await conn.execute(
+        """
+        UPDATE payload_gc_claims
+        SET status = 'deleted', finished_at = now(), last_error = NULL
+        WHERE sha256 = $1
+        """,
+        sha,
+    )
+
+
+async def mark_claim_cancelled(conn: asyncpg.Connection, sha: str) -> None:
+    await conn.execute(
+        """
+        UPDATE payload_gc_claims
+        SET status = 'cancelled', finished_at = now()
+        WHERE sha256 = $1 AND status IN ('registered', 'delete_due')
+        """,
+        sha,
+    )
+
+
+async def mark_claim_error(conn: asyncpg.Connection, sha: str, error: str) -> None:
+    await conn.execute(
+        "UPDATE payload_gc_claims SET last_error = $2 WHERE sha256 = $1",
+        sha,
+        error[:500],
+    )
+
+
+async def list_gc_claims(
+    conn: asyncpg.Connection, status: str | None = None, limit: int = 50
+) -> list[asyncpg.Record]:
+    if status is None:
+        rows = await conn.fetch(
+            """
+            SELECT sha256, object_key, reason, status, registered_at, delete_due_at,
+                   finished_at, last_error
+            FROM payload_gc_claims ORDER BY registered_at DESC LIMIT $1
+            """,
+            limit,
+        )
+    else:
+        rows = await conn.fetch(
+            """
+            SELECT sha256, object_key, reason, status, registered_at, delete_due_at,
+                   finished_at, last_error
+            FROM payload_gc_claims WHERE status = $2
+            ORDER BY registered_at DESC LIMIT $1
+            """,
+            limit,
+            status,
+        )
+    return list(rows)
+
+
+async def count_gc_claims(conn: asyncpg.Connection) -> dict[str, int]:
+    rows = await conn.fetch(
+        """
+        SELECT status, COUNT(*) AS n
+        FROM payload_gc_claims GROUP BY status
+        """
+    )
+    counts = {r["status"]: int(r["n"]) for r in rows}
+    return {
+        "registered": counts.get("registered", 0),
+        "delete_due": counts.get("delete_due", 0),
+        "deleted": counts.get("deleted", 0),
+        "cancelled": counts.get("cancelled", 0),
+    }

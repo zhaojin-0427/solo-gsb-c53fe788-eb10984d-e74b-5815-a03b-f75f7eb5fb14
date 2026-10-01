@@ -1,10 +1,17 @@
 # 可靠 Webhook 投递服务
 
-基于 **Python 3.12 + FastAPI + PostgreSQL** 的可靠 Webhook 投递系统，使用
-**Docker Compose** 一键启动。
+基于 **Python 3.12 + FastAPI + PostgreSQL + S3 兼容对象存储（本地 MinIO）** 的
+可靠 Webhook 投递系统，使用 **Docker Compose** 一键启动。
 
 能力：
 
+- **事件载荷内容寻址对象存储**：载荷以规范化 JSON（键排序、无空白）的
+  SHA-256 为内容地址存为 S3/MinIO 中的**不可变对象**，相同载荷全局去重；
+  数据库事件行只保留元数据与内容地址引用。提交由持久化状态机协调
+  “对象上传 ↔ 数据库事务”，任一步失败或进程重启都不会出现可见的半成品、
+  悬空引用或重复投递。旧 JSONB 数据支持在线、可断点续跑的迁移与双读切换；
+  垃圾回收带引用复核与宽限期两阶段删除，不会误删并发提交或重放引用的对象。
+  详见下文[“事件载荷对象存储（S3/MinIO）”](#事件载荷对象存储s3minio)。
 - **事件幂等提交**：生产者以 `(source, event_id)` 提交事件；重复提交返回原事件
   （HTTP 200，响应体 `duplicate: true`），**不新增任何投递**。
 - **订阅配置版本化 + 无损切换**：`target_url`、HMAC 密钥与重试参数保存为不可变版本
@@ -45,6 +52,7 @@
 | 服务 | 端口（宿主机） | 说明 |
 | --- | --- | --- |
 | `db` | 5432 | PostgreSQL 16，数据卷 `pgdata` 持久化 |
+| `minio` | 9000 / 9001 | S3 兼容对象存储（9000 API；9001 Web 控制台），数据卷 `miniodata` |
 | `api` | 8000 | FastAPI：提交事件、订阅管理、历史/死信/重放 API |
 | `worker` | — | 投递进程，靠数据库行锁认领任务，可水平扩展 |
 | `receiver` | 8001 | 本地回调接收器（开发/联调用） |
@@ -52,6 +60,10 @@
 密钥管理命令（明文迁移、主密钥轮换、移除旧密钥、状态查看）以一次性容器运行：
 `docker compose run --rm api python -m app.keyadmin <子命令>`，详见
 [“订阅密钥信封加密与主密钥轮换”](#订阅密钥信封加密与主密钥轮换)。
+
+载荷对象管理命令（旧 JSONB 迁移、双写切换、JSONB 副本回收、垃圾回收、状态）：
+`docker compose run --rm api python -m app.objadmin <子命令>`，详见
+[“事件载荷对象存储（S3/MinIO）”](#事件载荷对象存储s3minio)。
 
 投递顺序与租约在数据库层实现（核心见 `app/repository.py`）：
 
@@ -144,6 +156,155 @@ curl -i -X POST localhost:8000/api/v1/dead-letters/<delivery_id>/replay
 也可把目标设为 `http://receiver:8001/fail/2`：对同一投递前 2 次返回 500、
 第 3 次返回 200，可快速观察退避后重试成功。
 
+## 事件载荷对象存储（S3/MinIO）
+
+事件载荷不再保存在 PostgreSQL 的 JSONB 列中，而是存为 **S3 兼容对象存储中的
+不可变对象**；数据库只保存内容地址（SHA-256）等元数据。本地 Compose 用
+[MinIO](https://min.io/) 提供 S3 服务，生产环境把环境变量指向任何 S3 兼容
+端点（AWS S3、MinIO 集群、Ceph RGW 等）即可。
+
+### 内容寻址与去重
+
+```
+canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"),
+                       ensure_ascii=False).encode("utf-8")
+sha256    = hashlib.sha256(canonical).hexdigest()
+object    = s3://<bucket>/payloads/<sha前2位>/<sha64>
+```
+
+- 规范化规则与投递签名原文（紧凑排序 JSON）**逐字节一致**，因此“摘要复核通过”
+  即“投递字节与提交载荷一致”；键顺序/空白不同但语义相同的载荷归一化后摘要
+  相同，多个事件（甚至不同 source）自动共享同一个对象，天然去重。
+- 对象**不可变**：同一 key 的写入幂等（已存在只复核长度与元数据，绝不覆盖）；
+  内容不符会拒绝提交（`object_content_mismatch`）。
+- 数据库侧：`event_payloads` 是对象目录与提交状态机，`events.payload_sha256`
+  通过外键只引用目录中存在的对象。
+
+### 提交状态机（对象上传与数据库事务如何协调）
+
+每个内容地址 sha 有一把 Postgres 会话级咨询锁；提交（API）、迁移、GC 在该
+sha 上完全串行。协议三阶段：
+
+1. **登记意图（DB 事务 1）**：upsert `event_payloads(status='uploading')`
+   并提交。行先于对象存在——它是“即将上传对象 sha=X”的持久化意图。
+2. **上传对象（事务之外）**：按内容地址幂等上传（已存在即复用）。
+3. **提交引用（DB 事务 2，持同一把锁）**：先头校验对象确实存在（缺失则用本
+   进程持有的字节重传），再在**单事务**内把状态推进为 `committed`、插入事件
+   `(source, event_id)` 与各订阅投递。
+
+崩溃/失败分析：
+
+| 失败位置 | 后果 | 恢复 |
+| --- | --- | --- |
+| 阶段 1 | 无副作用 | 直接重试 |
+| 阶段 1 后、阶段 3 前进程被杀 | 残留 `uploading` 行（对象可能已上传） | 下次同摘要提交幂等接管；始终无人提交则在宽限期后被 GC 回收 |
+| 对象存储不可用 | 事件提交返回 `503 payload_store_unavailable` | 无半成品：事件/投递尚未插入；存储恢复后客户端重试即可 |
+| 阶段 3 失败 | 事务整体回滚，对外无任何可见事件/投递 | 对象不可变且可复用，重试安全 |
+| 重复提交 | `(source, event_id)` 唯一冲突 | 返回原事件 200，不新增投递（幂等不变） |
+
+因此对外**永远只可能**看到“事件引用已 committed 且对象确实存在”的状态，
+不会出现可见的半成品、悬空引用或重复投递。
+
+### Worker 取载荷：先复核摘要再签名
+
+Worker 认领投递后：
+
+1. 按事件的内容地址从对象存储取字节（迁移未覆盖的旧事件回退 JSONB 副本）；
+2. **强制复核 SHA-256**：对象字节的摘要必须等于事件引用的地址，不符/对象
+   缺失/存储不可用一律拒绝投递，尝试明细记为新结果
+   `outcome = "payload_error"`（`GET /deliveries/{id}/attempts` 可查），
+   与普通失败完全一样地参与退避、重试、死信结算——对象恢复后自动恢复；
+3. 复核通过后才解密钉住版本的订阅密钥并对同一批字节签名投递。
+
+幂等、严格顺序、租约接管、版本钉死、死信重放（重放只新建投递、仍引用原
+事件的同一对象）语义均保持不变。
+
+### MinIO 访问（本地）
+
+`docker compose up --build` 会同时启动 MinIO 并自动创建桶
+（默认 `webhook-payloads`）：
+
+- S3 API（应用使用）：<http://localhost:9000>
+- Web 控制台：<http://localhost:9001>，默认账号/密码 `minioadmin / minioadmin`
+  （用 `.env` 的 `S3_ACCESS_KEY_ID / S3_SECRET_ACCESS_KEY` 覆盖）
+- 桶内可直接浏览 `payloads/` 前缀，观察内容寻址对象与元数据
+  （`x-amz-meta-sha256`、`x-amz-meta-kind`）。
+
+### 旧 JSONB 数据的在线迁移与双读切换
+
+升级采用**双写 → 迁移 → 双读切换 → 回收副本**的在线流程，投递全程不中断，
+旧版本进程与新版本进程可以滚动共存：
+
+```bash
+# 0) 状态总览（也有 HTTP 接口 GET /api/v1/payload-storage/status）
+docker compose run --rm api python -m app.objadmin status
+
+# 1) 迁移旧 JSONB 事件 -> 对象存储（幂等、断点续跑、可并发多跑）
+docker compose run --rm api python -m app.objadmin migrate --batch-size 500
+
+# 2) 确认全部进程已升级、迁移归零后，关闭新事件的 JSONB 双写
+#    （开关持久化在 app_meta；默认 on 以兼容滚动升级）
+docker compose run --rm api python -m app.objadmin dual-write off
+
+# 3) 释放历史事件的 JSONB 副本（幂等、断点续跑；之后读路径完全走对象存储）
+docker compose run --rm api python -m app.objadmin drop-jsonb --batch-size 1000
+```
+
+- **双读**：读取（API 查事件、Worker 投递）优先用 JSONB 副本，副本为空则读
+  对象存储并复核摘要——因此迁移中途、切换前后任意时刻均可正常读/投递。
+- **双写**：迁移期新事件同时写对象与 JSONB（默认开启）；`dual-write off`
+  后新事件只写对象。请在确认没有旧版本进程在读 JSONB 后再切换。
+- **断点续跑**：迁移进度持久化在 `payload_migrations`（状态、已处理条数、
+  事件 id 游标）；对象上传与目录置 committed、事件回填在同批事务内完成，
+  崩溃后重跑自动从未处理事件继续；多个迁移进程靠 `FOR UPDATE SKIP LOCKED`
+  分批互不重复。对象存储故障时当批回滚、运行标记 `failed`，恢复后重跑续跑。
+
+### 垃圾回收（引用复核 + 宽限期 + 两阶段）
+
+```bash
+# 只回收数据库已知的废弃上传意图（uploading 超过宽限期且无事件引用）
+docker compose run --rm api python -m app.objadmin gc
+
+# 同时列举桶内对象，回收数据库目录中不存在的“孤儿对象”（建议定期执行）
+docker compose run --rm api python -m app.objadmin gc --scan
+
+# 宽限期默认 24h（PAYLOAD_GC_GRACE_SECONDS），演练时可临时缩短：
+docker compose run --rm api python -m app.objadmin gc --scan --grace-seconds 3600
+```
+
+两类回收目标：
+
+- `abandoned_upload`：宽限期后仍停在 `uploading` 且已无任何事件引用的目录行
+  （提交进程在阶段 1/2 后永久消失），目录行连同可能已上传的对象一起回收；
+- `orphan_object`：桶中存在但数据库目录完全没有的对象（阶段 2 上传后、
+  阶段 3 提交前进程被杀，或对象被带外写入）。
+
+两阶段协议（凭证表 `payload_gc_claims`）：
+
+1. **登记 + 宽限期**：候选对象先登记为 `registered`，删除时刻 =
+   now + 宽限期；登记在按 sha 的咨询锁下做“目录是否存在”复核，与提交协议
+   阶段 1 互斥。
+2. **到期删除**：到期后持同一把锁，在事务内再次复核“目录无 committed 行且
+   events 无引用”才物理删除 S3 对象；复核期间若对象已被并发提交/重放引用，
+   凭证标记 `cancelled`，对象保留。
+
+并发安全：提交（阶段 1/3）、迁移回填与 GC 的所有“引用判定 ↔ 对象删除”
+都在同一把按 sha 的咨询锁下串行；删除在删除前的最后一刻仍做引用复核，
+因此**并发提交或死信重放正在引用的对象不可能被误删**。GC 本身幂等，
+可安全并发、重复运行；`objadmin status` 可查看各状态凭证数量。
+
+### 相关配置
+
+| 变量 | 默认值（Compose） | 说明 |
+| --- | --- | --- |
+| `S3_ENDPOINT_URL` | `http://minio:9000` | S3 兼容端点；留空走 AWS 默认端点 |
+| `S3_REGION` | `us-east-1` | 区域/签名区域 |
+| `S3_ACCESS_KEY_ID` / `S3_SECRET_ACCESS_KEY` | `minioadmin` / `minioadmin` | 凭据（生产必须更换） |
+| `S3_BUCKET` | `webhook-payloads` | 载荷桶；不存在时启动自动创建 |
+| `S3_FORCE_PATH_STYLE` | `true` | MinIO 等自建端点必须为 true |
+| `PAYLOAD_GC_GRACE_SECONDS` | `86400` | GC 宽限期（秒） |
+| `MINIO_API_PORT` / `MINIO_CONSOLE_PORT` | `9000` / `9001` | MinIO 宿主机映射端口 |
+
 ## API 一览
 
 所有业务 API 前缀为 `/api/v1`，交互文档见 `/docs`。
@@ -164,10 +325,16 @@ curl -i -X POST localhost:8000/api/v1/dead-letters/<delivery_id>/replay
 | GET | `/dead-letters?subscription_id=&source=` | 死信列表 |
 | POST | `/dead-letters/{id}/replay` | 死信重放（201；非死信 409；链上有未完成投递 409） |
 | GET | `/crypto/status` | 密钥环/迁移/轮换状态（只含 key_id，不含密钥材料） |
+| GET | `/payload-storage/status` | 载荷对象存储/迁移/双写/GC 状态（只含计数与摘要） |
 | GET | `/health` | 健康检查 |
 
 投递状态：`pending`（等待/退避中）、`in_flight`（已被 Worker 认领）、
 `succeeded`、`dead_lettered`。
+
+尝试结果 `outcome`：`success`、`http_error`、`network_error`、`timeout`、
+`security_blocked`、`crypto_error`（密钥不可用）、`payload_error`
+（载荷对象缺失/摘要复核失败/对象存储不可用）；后两者与普通失败一样参与
+退避、重试与死信结算，故障恢复后自动恢复投递。
 
 ## 配置版本与无损切换
 
@@ -560,6 +727,13 @@ WEBHOOK_ALLOWED_HOSTS=receiver,127.0.0.1,localhost docker compose up --build
 | `WEBHOOK_MAX_REDIRECTS` | `5` | Worker 跟随重定向的最大跳数（每跳重新做同一安全校验） |
 | `WEBHOOK_KEYRING_JSON` | 空 | 密钥环 JSON（非空时优先）；compose 默认改用挂载文件 |
 | `WEBHOOK_KEYRING_FILE` | `/run/keyring/keyring.json`（compose 内） | 密钥环 JSON 文件路径；compose 默认挂载 `./deploy/dev-keyring.json` |
+| `S3_ENDPOINT_URL` | `http://minio:9000`（compose 内） | S3 兼容对象存储端点；留空走 AWS 默认端点 |
+| `S3_REGION` | `us-east-1` | 区域 |
+| `S3_ACCESS_KEY_ID` / `S3_SECRET_ACCESS_KEY` | `minioadmin` / `minioadmin` | 对象存储凭据（生产必须更换） |
+| `S3_BUCKET` | `webhook-payloads` | 事件载荷桶（不存在自动创建） |
+| `S3_FORCE_PATH_STYLE` | `true` | 自建端点（MinIO）需 path-style；AWS 可设 false |
+| `PAYLOAD_GC_GRACE_SECONDS` | `86400` | 载荷 GC 宽限期秒数 |
+| `MINIO_API_PORT` / `MINIO_CONSOLE_PORT` | `9000` / `9001` | MinIO 宿主机映射端口（API/Web 控制台） |
 
 ### 出站策略的启动与访问
 
@@ -578,7 +752,18 @@ WEBHOOK_ALLOWED_HOSTS=receiver,127.0.0.1,localhost docker compose up --build
 
 ## 数据库表
 
-- `events`：事件，`(source, event_id)` 唯一。
+- `events`：事件，`(source, event_id)` 唯一。`payload_sha256` 引用对象存储
+  中的不可变载荷（外键到 `event_payloads`）；`payload` JSONB 列仅用于旧数据
+  与在线迁移期的双读/双写，迁移切换并回收后为 NULL。
+- `event_payloads`：载荷对象目录与提交状态机，主键即内容地址 SHA-256。
+  `status` 为 `uploading`（已登记上传意图，对象可能未传完）/`committed`
+  （对象已确认存在、可被事件引用）；另存对象 key、字节数与时间戳。
+- `payload_gc_claims`：垃圾回收两阶段凭证（`registered` → 删除 →
+  `deleted`；对象重新被引用则 `cancelled`），含宽限期到期时刻与错误信息。
+- `payload_migrations`：JSONB → 对象存储迁移运行记录（状态、已处理条数、
+  事件 id 游标、错误），持久化迁移进度，支持断点续跑与失败恢复；同一时刻
+  至多一条进行中运行（部分唯一索引）。
+- `app_meta`：应用级元数据键值（如迁移期开关 `payload_jsonb_dual_write`）。
 - `subscriptions`：订阅身份（source、启用状态、`current_revision`）。
   `target_url` 列随当前版本冗余同步；`secret` 冗余列不再保存明文（统一置空），
   权威配置在版本表。
@@ -595,9 +780,11 @@ WEBHOOK_ALLOWED_HOSTS=receiver,127.0.0.1,localhost docker compose up --build
   `(chain_id, chain_seq=1)`；重放沿用同一 `chain_id` 且 `chain_seq` 递增，
   从而保留完整历史。`seq` 是订阅顺序号。
 - `delivery_attempts`：每次尝试的 Worker、结果分类（success/http_error/
-  network_error/timeout/**security_blocked**/**crypto_error**）、HTTP 状态码、
+  network_error/timeout/**security_blocked**/**crypto_error**/
+  **payload_error**）、HTTP 状态码、
   响应摘要（截断 2048 字符）、错误信息（security_blocked 时含被拒地址与类别；
-  crypto_error 时含 key_id 与失败分类，不含密钥材料）、租约起止时间。
+  crypto_error 时含 key_id 与失败分类，不含密钥材料；payload_error 时含
+  摘要/对象存储失败分类）、租约起止时间。
 
 ## 本地开发（不使用 Docker）
 
@@ -607,6 +794,10 @@ pip install -r requirements.txt
 
 # 需要一个可连接的 PostgreSQL
 export DATABASE_URL=postgresql://user:pass@localhost:5432/webhooks
+# 需要一个 S3 兼容端点（本地可起 MinIO：minio server /data；或用 moto 模拟）
+export S3_ENDPOINT_URL=http://127.0.0.1:9000
+export S3_ACCESS_KEY_ID=minioadmin S3_SECRET_ACCESS_KEY=minioadmin
+export S3_BUCKET=webhook-payloads
 # 本地密钥环（开发示例；生产用 keyadmin generate-key 生成并妥善保管）
 export WEBHOOK_KEYRING_JSON='{"active_key_id":"dev-k1","keys":{"dev-k1":"MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY="}}'
 uvicorn app.main:app --reload --port 8000          # API
@@ -615,6 +806,10 @@ uvicorn app.receiver:app --port 8001               # 接收器
 
 # 密钥管理（迁移 / 轮换 / 移除 / 状态）
 python -m app.keyadmin status
+# 载荷对象管理（迁移 / 双写切换 / JSONB 回收 / 垃圾回收 / 状态）
+python -m app.objadmin status
+python -m app.objadmin migrate
+python -m app.objadmin gc --scan
 ```
 
 仓库还包含三个本地验证脚本（非 Docker 依赖，会自动拉起便携 PostgreSQL）：
@@ -629,3 +824,7 @@ python -m app.keyadmin status
   迁移期间新旧格式均可投递、migrate/rotate 幂等断点续跑、轮换只重包裹 DEK、
   旧密钥移除守卫、未知 key_id 拒绝投递并记录 `crypto_error`、修复后重放恢复、
   未配置密钥环时写入 503。
+- `test_payload_store.py`：载荷对象存储专项（便携 Postgres + 模拟 S3）——
+  三阶段提交状态机与幂等去重、崩溃残留接管、损坏对象摘要复核拒绝
+  （`payload_error`）、旧 JSONB 在线迁移断点续跑、双写切换与 JSONB 副本
+  回收、GC 引用复核/宽限期/两阶段删除、提交与 GC 的并发竞态互斥。

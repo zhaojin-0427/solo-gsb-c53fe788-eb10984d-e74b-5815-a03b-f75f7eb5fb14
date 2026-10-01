@@ -46,6 +46,21 @@ async def _init_connection(conn: asyncpg.Connection) -> None:
 #   迁移/新写入后该列置空；subscriptions.secret 冗余列同样不再写明文；
 # - key_rotations 持久化主密钥轮换进度：轮换只重包裹 DEK（不动密钥密文），
 #   可断点续跑、可并发执行。
+#
+# 事件载荷对象存储（S3 兼容；见 app/object_store.py、app/payload_object.py）：
+# - 载荷按规范化 JSON 的 SHA-256 内容寻址，存于对象存储的不可变对象
+#   （key=payloads/<sha2位>/<sha64>）；相同载荷全局去重。
+# - event_payloads 是“对象上传 ↔ 数据库事务”的持久化状态机：
+#     uploading  = 已登记上传意图（行已存在，对象可能尚未/正在上传）
+#     committed  = 对象已确认存在，且可被事件引用
+#   协议：提交事务先插 uploading 行并提交 -> 幂等上传对象（已存在即复用）
+#   -> 再开事务把状态推进 committed 并在同一事务插入事件与投递。任一步崩溃：
+#   uploading 行会被下一次同摘要提交接管，或在宽限期后被 GC 回收；
+#   事件外键保证不存在“引用了缺失对象”的悬空行。
+# - events.payload_sha256 引用不可变对象；events.payload（JSONB）仅用于
+#   迁移前旧数据与在线迁移期的双读/双写，迁移/切换后可为空。
+# - payload_gc_claims 是垃圾回收的两阶段凭证（宽限期 + 引用复核），
+#   防止并发提交或重放需要的对象被误删。
 
 
 def _schema_statements(
@@ -134,15 +149,107 @@ def _schema_statements(
         CREATE UNIQUE INDEX IF NOT EXISTS uq_key_rotations_active
             ON key_rotations (new_key_id) WHERE status = 'running'
         """,
+        # 应用级元数据键值（如迁移期 JSONB 双写开关 payload_jsonb_dual_write）
+        """
+        CREATE TABLE IF NOT EXISTS app_meta (
+            key        TEXT PRIMARY KEY,
+            value      JSONB NOT NULL,
+            updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+        )
+        """,
+        # 载荷对象的持久化提交状态机 + 对象目录（见文件头注释）
+        """
+        CREATE TABLE IF NOT EXISTS event_payloads (
+            sha256          TEXT PRIMARY KEY,
+            object_key      TEXT NOT NULL,
+            size_bytes      BIGINT NOT NULL,
+            status          TEXT NOT NULL CHECK (status IN ('uploading', 'committed')),
+            created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+            updated_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+            committed_at    TIMESTAMPTZ
+        )
+        """,
+        # GC 扫描：宽限期后仍在 uploading 的废弃上传意图
+        """
+        CREATE INDEX IF NOT EXISTS idx_event_payloads_status_updated
+            ON event_payloads (status, updated_at)
+        """,
+        # 垃圾回收两阶段凭证：
+        # phase=registered 登记桶内无目录的孤儿对象，经宽限期且复核仍无引用后
+        # 删除；phase=delete_due 表示宽限期已到、本轮可以执行 S3 删除。
+        # 删除后行保留为 deleted 墓碑（短留存，便于观测），由 purge 清理。
+        """
+        CREATE TABLE IF NOT EXISTS payload_gc_claims (
+            sha256       TEXT PRIMARY KEY,
+            object_key   TEXT NOT NULL,
+            reason       TEXT NOT NULL CHECK (reason IN
+                         ('orphan_object', 'abandoned_upload')),
+            status       TEXT NOT NULL CHECK (status IN
+                         ('registered', 'delete_due', 'deleted', 'cancelled')),
+            registered_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+            delete_due_at TIMESTAMPTZ,
+            finished_at   TIMESTAMPTZ,
+            last_error    TEXT
+        )
+        """,
+        """
+        CREATE INDEX IF NOT EXISTS idx_payload_gc_claims_status
+            ON payload_gc_claims (status, delete_due_at)
+        """,
+        # 载荷迁移运行记录（JSONB -> 对象存储）：状态/进度/游标持久化，
+        # 崩溃或中断后重跑同一命令即断点续跑。
+        """
+        CREATE TABLE IF NOT EXISTS payload_migrations (
+            id              BIGSERIAL PRIMARY KEY,
+            status          TEXT NOT NULL CHECK (status IN
+                                ('running', 'completed', 'failed')),
+            processed_count BIGINT NOT NULL DEFAULT 0,
+            last_event_id   BIGINT NOT NULL DEFAULT 0,
+            last_error      TEXT,
+            started_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+            updated_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+            finished_at     TIMESTAMPTZ
+        )
+        """,
+        # 同一时刻至多一条进行中的载荷迁移（并发进程会接管同一运行）
+        """
+        CREATE UNIQUE INDEX IF NOT EXISTS uq_payload_migrations_active
+            ON payload_migrations ((1)) WHERE status IN ('running', 'failed')
+        """,
         """
         CREATE TABLE IF NOT EXISTS events (
             id          BIGSERIAL PRIMARY KEY,
             source      TEXT NOT NULL,
             event_id    TEXT NOT NULL,
-            payload     JSONB NOT NULL DEFAULT '{}'::jsonb,
+            payload     JSONB,
+            payload_sha256 TEXT,
             created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
             UNIQUE (source, event_id)
         )
+        """,
+        # 旧库升级：events 补 payload_sha256（迁移前为 NULL，由迁移批量回填）
+        """
+        ALTER TABLE events ADD COLUMN IF NOT EXISTS payload_sha256 TEXT
+        """,
+        # 载荷引用：仅允许引用已 committed 的不可变对象。
+        # （先加列、回填、再补约束的顺序支持旧库在线升级；DO 守卫保证幂等。）
+        """
+        DO $$
+        BEGIN
+            IF NOT EXISTS (
+                SELECT 1 FROM pg_constraint
+                WHERE conrelid = 'events'::regclass
+                  AND conname = 'fk_events_payload'
+            ) THEN
+                ALTER TABLE events
+                    ADD CONSTRAINT fk_events_payload
+                    FOREIGN KEY (payload_sha256) REFERENCES event_payloads(sha256);
+            END IF;
+        END$$
+        """,
+        """
+        CREATE INDEX IF NOT EXISTS idx_events_payload_sha
+            ON events (payload_sha256)
         """,
         # 投递链：重放时复用同一 chain_id，chain_seq 从 1 递增；链内严格有序
         "CREATE SEQUENCE IF NOT EXISTS delivery_chain_seq START 1",
@@ -196,7 +303,7 @@ def _schema_statements(
             finished_at      TIMESTAMPTZ,
             outcome          TEXT NOT NULL CHECK (outcome IN
                                  ('success', 'http_error', 'network_error', 'timeout',
-                                  'security_blocked', 'crypto_error')),
+                                  'security_blocked', 'crypto_error', 'payload_error')),
             http_status      INTEGER,
             response_excerpt TEXT,
             error_message    TEXT,
@@ -209,8 +316,8 @@ def _schema_statements(
         CREATE INDEX IF NOT EXISTS idx_attempts_delivery
             ON delivery_attempts (delivery_id, attempt_number)
         """,
-        # 旧库升级：放宽 delivery_attempts.outcome 的 CHECK，纳入 security_blocked
-        # 与 crypto_error。旧约束名为 Postgres 自动命名
+        # 旧库升级：放宽 delivery_attempts.outcome 的 CHECK，纳入 security_blocked、
+        # crypto_error 与 payload_error。旧约束名为 Postgres 自动命名
         # （delivery_attempts_outcome_check），存在则替换；新建库上面的
         # CREATE TABLE 已带新约束，DROP IF EXISTS 不会命中任何东西，
         # 随后 ADD CONSTRAINT 因约束已存在而跳过（DO 块守卫）。
@@ -230,7 +337,7 @@ def _schema_statements(
                     ADD CONSTRAINT delivery_attempts_outcome_check
                     CHECK (outcome IN
                         ('success', 'http_error', 'network_error', 'timeout',
-                         'security_blocked', 'crypto_error'));
+                         'security_blocked', 'crypto_error', 'payload_error'));
             END IF;
         END$$
         """,

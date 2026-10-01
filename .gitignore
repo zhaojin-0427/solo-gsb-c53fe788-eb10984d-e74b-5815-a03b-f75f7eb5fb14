@@ -7,3 +7,4 @@ __pycache__/
 .test-crypto-pgdata/
 test-*.log
 stress-*.log
+.test-pgdata-payload/

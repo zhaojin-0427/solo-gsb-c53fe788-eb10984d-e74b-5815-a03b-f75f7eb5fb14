@@ -18,6 +18,40 @@ services:
       retries: 20
     restart: unless-stopped
 
+  minio:
+    # 生产环境建议固定到具体 RELEASE 标签或镜像摘要
+    image: minio/minio:latest
+    command: ["server", "/data", "--console-address", ":9001"]
+    environment:
+      MINIO_ROOT_USER: ${S3_ACCESS_KEY_ID:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${S3_SECRET_ACCESS_KEY:-minioadmin}
+    ports:
+      # S3 API 与 Web 控制台（仅开发暴露；生产勿暴露到公网）
+      - "${MINIO_API_PORT:-9000}:9000"
+      - "${MINIO_CONSOLE_PORT:-9001}:9001"
+    volumes:
+      - miniodata:/data
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 3s
+      timeout: 3s
+      retries: 30
+    restart: unless-stopped
+
+  # 一次性初始化任务：创建载荷桶后退出（幂等；应用本身也会 ensure bucket，
+  # 该任务主要让 compose up 的健康/依赖顺序更直观）。
+  minio-init:
+    image: minio/mc:latest
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint: >
+      /bin/sh -c "
+      mc alias set local http://minio:9000 ${S3_ACCESS_KEY_ID:-minioadmin} ${S3_SECRET_ACCESS_KEY:-minioadmin};
+      mc mb --ignore-existing local/${S3_BUCKET:-webhook-payloads};
+      echo 'bucket ready: ${S3_BUCKET:-webhook-payloads}';
+      "
+
   api:
     build: .
     command: ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
@@ -38,6 +72,14 @@ services:
       # 在 .env 中设置即可，无需改动挂载。
       WEBHOOK_KEYRING_JSON: ${WEBHOOK_KEYRING_JSON:-}
       WEBHOOK_KEYRING_FILE: ${WEBHOOK_KEYRING_FILE:-/run/keyring/keyring.json}
+      # 事件载荷对象存储（S3 兼容；compose 内为本地 MinIO）
+      S3_ENDPOINT_URL: http://minio:9000
+      S3_REGION: ${S3_REGION:-us-east-1}
+      S3_ACCESS_KEY_ID: ${S3_ACCESS_KEY_ID:-minioadmin}
+      S3_SECRET_ACCESS_KEY: ${S3_SECRET_ACCESS_KEY:-minioadmin}
+      S3_BUCKET: ${S3_BUCKET:-webhook-payloads}
+      S3_FORCE_PATH_STYLE: ${S3_FORCE_PATH_STYLE:-true}
+      PAYLOAD_GC_GRACE_SECONDS: ${PAYLOAD_GC_GRACE_SECONDS:-86400}
     volumes:
       - ${WEBHOOK_KEYRING_HOST_FILE:-./deploy/dev-keyring.json}:/run/keyring/keyring.json:ro
     ports:
@@ -45,6 +87,10 @@ services:
     depends_on:
       db:
         condition: service_healthy
+      minio:
+        condition: service_healthy
+      minio-init:
+        condition: service_completed_successfully
     restart: unless-stopped
 
   worker:
@@ -65,11 +111,23 @@ services:
       # 与 api 使用同一密钥环：Worker 在签名前解包 DEK 解密订阅密钥
       WEBHOOK_KEYRING_JSON: ${WEBHOOK_KEYRING_JSON:-}
       WEBHOOK_KEYRING_FILE: ${WEBHOOK_KEYRING_FILE:-/run/keyring/keyring.json}
+      # 与 api 使用同一对象存储：Worker 取载荷对象并复核 SHA-256 后才签名
+      S3_ENDPOINT_URL: http://minio:9000
+      S3_REGION: ${S3_REGION:-us-east-1}
+      S3_ACCESS_KEY_ID: ${S3_ACCESS_KEY_ID:-minioadmin}
+      S3_SECRET_ACCESS_KEY: ${S3_SECRET_ACCESS_KEY:-minioadmin}
+      S3_BUCKET: ${S3_BUCKET:-webhook-payloads}
+      S3_FORCE_PATH_STYLE: ${S3_FORCE_PATH_STYLE:-true}
+      PAYLOAD_GC_GRACE_SECONDS: ${PAYLOAD_GC_GRACE_SECONDS:-86400}
     volumes:
       - ${WEBHOOK_KEYRING_HOST_FILE:-./deploy/dev-keyring.json}:/run/keyring/keyring.json:ro
     depends_on:
       db:
         condition: service_healthy
+      minio:
+        condition: service_healthy
+      minio-init:
+        condition: service_completed_successfully
     restart: unless-stopped
 
   receiver:
@@ -84,3 +142,4 @@ services:
 
 volumes:
   pgdata:
+  miniodata:

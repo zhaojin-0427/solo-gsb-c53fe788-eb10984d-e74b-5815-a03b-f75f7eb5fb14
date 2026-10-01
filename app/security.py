@@ -19,13 +19,27 @@ def compact_json(payload: Any) -> str:
 
 def sign(secret: str, timestamp: int, payload: Any) -> str:
     body = compact_json(payload)
-    signed = f"{timestamp}.{body}".encode("utf-8")
-    digest = hmac.new(secret.encode("utf-8"), signed, hashlib.sha256).hexdigest()
-    return digest
+    return sign_body(secret, timestamp, body.encode("utf-8"))
+
+
+def sign_body(secret: str, timestamp: int, body: bytes) -> str:
+    """对已规范化的载荷字节签名（Worker 取对象并复核摘要后使用）。
+
+    传入字节必须就是 HTTP 请求体（规范化 JSON）；签名原文
+    `"<timestamp>.<载荷字节>"`，与 sign() 逐字节一致。
+    """
+    signed = str(timestamp).encode("ascii") + b"." + body
+    return hmac.new(secret.encode("utf-8"), signed, hashlib.sha256).hexdigest()
 
 
 def build_signature_header(secret: str, timestamp: int, payload: Any) -> str:
     return f"t={timestamp},v1={sign(secret, timestamp, payload)}"
+
+
+def build_signature_header_for_body(
+    secret: str, timestamp: int, body: bytes
+) -> str:
+    return f"t={timestamp},v1={sign_body(secret, timestamp, body)}"
 
 
 def verify(secret: str, timestamp: int, payload: Any, signature_hex: str) -> bool:

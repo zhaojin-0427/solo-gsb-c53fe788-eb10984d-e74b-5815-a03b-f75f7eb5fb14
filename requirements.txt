@@ -4,3 +4,4 @@ asyncpg==0.30.0
 httpx==0.28.1
 pydantic==2.10.4
 cryptography==43.0.3
+boto3==1.35.92

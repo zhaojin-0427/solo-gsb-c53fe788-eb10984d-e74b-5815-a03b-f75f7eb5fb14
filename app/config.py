@@ -19,6 +19,13 @@ def _get_float(name: str, default: float) -> float:
     return float(raw)
 
 
+def _get_bool(name: str, default: bool) -> bool:
+    raw = os.getenv(name)
+    if raw is None or raw.strip() == "":
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
 @dataclass(frozen=True)
 class Settings:
     database_url: str = os.getenv(
@@ -49,6 +56,18 @@ class Settings:
     # 两者都为空表示未配置（新配置版本无法写入，已加密版本无法投递）。
     keyring_json: str = os.getenv("WEBHOOK_KEYRING_JSON", "")
     keyring_file: str = os.getenv("WEBHOOK_KEYRING_FILE", "")
+    # ---- 事件载荷对象存储（S3 兼容，本地为 MinIO）----
+    # 载荷按规范化 JSON 的 SHA-256 内容寻址存对象，事件只引用不可变对象；
+    # 数据库 events 表只留元数据（payload_sha256；迁移期 payload JSONB 双读）。
+    s3_endpoint_url: str = os.getenv("S3_ENDPOINT_URL", "")
+    s3_region: str = os.getenv("S3_REGION", "us-east-1")
+    s3_access_key: str = os.getenv("S3_ACCESS_KEY_ID", "minioadmin")
+    s3_secret_key: str = os.getenv("S3_SECRET_ACCESS_KEY", "minioadmin")
+    s3_bucket: str = os.getenv("S3_BUCKET", "webhook-payloads")
+    # 自建端点（MinIO）必须 path-style；指向 AWS 且用虚拟主机风格时可设 false
+    s3_force_path_style: bool = _get_bool("S3_FORCE_PATH_STYLE", True)
+    # 垃圾回收宽限期（秒）：超过此时长仍无任何引用的对象/上传意图才可回收
+    gc_grace_seconds: int = _get_int("PAYLOAD_GC_GRACE_SECONDS", 24 * 3600)
 
 
 settings = Settings()

@@ -85,7 +85,7 @@ class AttemptOut(BaseModel):
     finished_at: datetime | None
     outcome: Literal[
         "success", "http_error", "network_error", "timeout",
-        "security_blocked", "crypto_error"
+        "security_blocked", "crypto_error", "payload_error"
     ]
     http_status: int | None
     response_excerpt: str | None
@@ -162,3 +162,34 @@ class CryptoStatusOut(BaseModel):
     # 数据库引用但本地密钥环中不存在的 key_id（这些版本的投递会被拒绝）
     unknown_key_ids_in_use: list[str]
     rotations: list[RotationRunOut]
+
+
+# -- 载荷对象存储状态 -------------------------------------------------------------
+
+
+class PayloadMigrationRunOut(BaseModel):
+    id: int
+    status: str
+    processed_count: int
+    last_event_id: int
+    last_error: str | None
+    started_at: datetime
+    updated_at: datetime
+    finished_at: datetime | None
+
+
+class PayloadStorageStatusOut(BaseModel):
+    """载荷对象存储 / 迁移 / GC 状态（只含计数与摘要，不含载荷内容）。"""
+
+    configured: bool
+    endpoint_url: str
+    bucket: str
+    dual_write_jsonb: bool
+    # 旧 JSONB 事件：未回填内容地址（待迁移）
+    legacy_events_pending: int
+    # 仍保留 JSONB 副本的事件（双写期/待回收）
+    dual_copy_events: int
+    committed_objects: int
+    uploading_objects: int
+    gc_claims: dict[str, int]
+    migrations: list[PayloadMigrationRunOut]

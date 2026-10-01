@@ -26,6 +26,12 @@ from app.egress_policy import EgressPolicyError, policy_from_env
 from app.egress_transport import PolicyAsyncTransport
 from app.envelope import SecretCryptoError, resolve_secret
 from app.keyring import get_keyring
+from app.object_store import ObjectStoreError, get_object_store
+from app.payload_service import (
+    PayloadUnavailable,
+    fetch_and_verify,
+)
+from app.payload_object import object_key
 
 log = logging.getLogger("webhook.worker")
 
@@ -47,18 +53,17 @@ def compute_backoff(
 
 
 async def deliver_once(
-    client: httpx.AsyncClient, context: dict
+    client: httpx.AsyncClient, context: dict, body: bytes
 ) -> tuple[str, int | None, str | None, str | None, bool]:
     """执行一次 HTTP 投递。
 
+    body 是已经过 SHA-256 复核的规范化载荷字节（签名原文即 HTTP 请求体）。
     返回 (outcome, http_status, response_excerpt, error_message, succeeded)。
     """
-    payload = dict(context["payload"])
     timestamp = security.now_timestamp()
-    signature = security.build_signature_header(
-        context["secret"], timestamp, payload
+    signature = security.build_signature_header_for_body(
+        context["secret"], timestamp, body
     )
-    body = security.compact_json(payload)
     headers = {
         "Content-Type": "application/json",
         "X-Webhook-Signature": signature,
@@ -72,7 +77,7 @@ async def deliver_once(
     }
     try:
         response = await client.post(
-            context["target_url"], content=body.encode("utf-8"), headers=headers
+            context["target_url"], content=body, headers=headers
         )
     except EgressPolicyError as exc:
         # 出站安全策略拒绝（含重定向后任意一跳命中阻止类别）：
@@ -134,6 +139,52 @@ async def handle_one(pool, client: httpx.AsyncClient) -> bool:
         context["attempt_number"],
     )
 
+    # 取载荷并在签名前复核摘要：
+    # - 新路径：events.payload_sha256 引用不可变对象，从对象存储取字节并
+    #   强制 SHA-256 复核，摘要不符/对象缺失/存储不可用一律拒绝投递，
+    #   记 payload_error（与普通失败一样退避/重试/死信，对象恢复后自动恢复）；
+    # - 迁移期双读兜底：未回填内容地址的旧事件回退 JSONB 副本，规范化后投递
+    #   （字节与签名原文本就一致），迁移完成后该分支不再命中。
+    sha = context.get("payload_sha256")
+    store = get_object_store()
+    try:
+        if sha:
+            payload = await fetch_and_verify(
+                store, sha, context["object_key"] or object_key(sha)
+            )
+        else:
+            legacy = context.get("legacy_payload")
+            if legacy is None:
+                raise PayloadUnavailable(
+                    "payload_not_migrated",
+                    "事件既无内容地址引用也无 JSONB 副本，无法投递",
+                )
+            payload = dict(legacy)
+        body = security.compact_json(payload).encode("utf-8")
+    except (PayloadUnavailable, ObjectStoreError) as exc:
+        code = getattr(exc, "code", "object_store_error")
+        message = getattr(exc, "message", str(exc))
+        log.warning("投递 id=%s 载荷不可用[%s]: %s", delivery_id, code, message)
+        outcome, http_status, excerpt, error_message, succeeded = (
+            "payload_error",
+            None,
+            None,
+            f"载荷校验失败[{code}]: {message}",
+            False,
+        )
+        # 载荷不可用无需解密密钥，直接走结算。
+        return await _settle(
+            pool,
+            claim,
+            delivery_id,
+            context,
+            outcome,
+            http_status,
+            excerpt,
+            error_message,
+            succeeded,
+        )
+
     # 仅在签名前解密订阅密钥（信封格式解包 DEK 后解密；旧明文格式直接回退）。
     # 未知 key_id / 认证失败 / 未配置密钥环：拒绝投递并记录可查询的 crypto_error，
     # 与普通失败一样参与退避/重试/死信结算（修复密钥环后可自动恢复）。
@@ -155,9 +206,35 @@ async def handle_one(pool, client: httpx.AsyncClient) -> bool:
         )
     else:
         outcome, http_status, excerpt, error_message, succeeded = await deliver_once(
-            client, context
+            client, context, body
         )
 
+    return await _settle(
+        pool,
+        claim,
+        delivery_id,
+        context,
+        outcome,
+        http_status,
+        excerpt,
+        error_message,
+        succeeded,
+    )
+
+
+async def _settle(
+    pool,
+    claim: dict,
+    delivery_id: int,
+    context: dict,
+    outcome: str,
+    http_status: int | None,
+    excerpt: str | None,
+    error_message: str | None,
+    succeeded: bool,
+) -> bool:
+    """租约栅栏下记录尝试并结算；返回本轮是否处理了任务（恒为 True）。"""
+    lease_token = claim["lease_token"]
     # 租约栅栏：记录尝试与结算都校验 leased_by == lease_token，
     # 若任务已因租约超时被接管，本次结果作废，避免覆盖新 Worker 的状态。
     async with pool.acquire() as conn:
@@ -220,6 +297,11 @@ async def handle_one(pool, client: httpx.AsyncClient) -> bool:
 async def run() -> None:
     log.info("Worker 启动 id=%s", WORKER_ID)
     pool = await init_db()
+    # 对象存储：确保桶存在（等待 MinIO/S3 就绪）；不可用则启动失败，
+    # 避免 Worker 把所有任务都结算成 payload_error。
+    from app.object_store import init_object_store
+
+    await init_object_store()
     # 启动时加载本地密钥环：配置非法直接退出；未配置则明文旧记录可投递、
     # 已加密记录以 crypto_error 结算（可查询），修复配置后自动恢复。
     get_keyring()
